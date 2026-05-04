@@ -95,18 +95,47 @@ def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
 # ─── Account ──────────────────────────────────────────────────────────────────
 
 def get_balance() -> float:
-    """Return available USDT balance."""
-    data = _get("/openApi/swap/v3/user/balance")
-    if data.get("code") == 0:
-        for asset in data.get("data", {}).get("balance", []):
-            if asset.get("asset") == "USDT":
-                return float(asset.get("availableMargin", 0))
-    # fallback v2
-    data2 = _get("/openApi/swap/v2/user/balance")
-    if data2.get("code") == 0:
-        bal = data2.get("data", {}).get("balance", {})
-        if isinstance(bal, dict):
-            return float(bal.get("availableMargin", bal.get("available", 0)))
+    """Return available USDT balance. Handles all BingX response formats."""
+
+    def _extract(payload: dict) -> float:
+        raw = payload.get("data", {})
+
+        # Format A: data is a list of asset dicts
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and item.get("asset") == "USDT":
+                    return float(item.get("availableMargin",
+                                  item.get("available",
+                                  item.get("balance", 0))))
+            return 0.0
+
+        # Format B: data = {"balance": [...]}
+        if isinstance(raw, dict):
+            bal = raw.get("balance", raw)
+            if isinstance(bal, list):
+                for item in bal:
+                    if isinstance(item, dict) and item.get("asset") == "USDT":
+                        return float(item.get("availableMargin",
+                                      item.get("available", 0)))
+            # Format C: data = {"balance": {"availableMargin": ...}}
+            if isinstance(bal, dict):
+                return float(bal.get("availableMargin",
+                              bal.get("available",
+                              bal.get("equity", 0))))
+        return 0.0
+
+    # Try v3 first
+    for endpoint in ("/openApi/swap/v3/user/balance", "/openApi/swap/v2/user/balance"):
+        try:
+            resp = _get(endpoint)
+            if resp.get("code") == 0:
+                val = _extract(resp)
+                if val > 0:
+                    return val
+        except Exception as e:
+            logger.warning(f"Balance endpoint {endpoint} error: {e}")
+
+    logger.error("Could not fetch balance from any endpoint")
     return 0.0
 
 
