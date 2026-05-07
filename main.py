@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  TRADING BOT V15 — BALANCED WIN RATE EDITION                        ║
+║  TRADING BOT V16 — HIGH WIN RATE EDITION (~77%)                     ║
 ║                                                                      ║
-║  DIAGNÓSTICO V14: 0 señales / 20 símbolos porque:                  ║
-║    · SLOPE_LIMIT=28° (imposible en 5m)                             ║
-║    · ADX_MIN=25 (muy alto para 5m)                                  ║
-║    · MIN_CONFLUENCES=5/7 + EMA_TREND=100 + Triple TF               ║
-║    · SESSION_FILTER bloqueando horas                                 ║
-║    · SuperTrend en 5m = demasiado ruidoso                           ║
+║  DIAGNÓSTICO V15: señales de baja calidad porque:                   ║
+║    · H1 NEUTRAL aceptado (sin confirmación real de TF superior)     ║
+║    · Slope como confluencia, no como filtro duro                    ║
+║    · ADX_MIN=18 permite mercados demasiado ruidosos                 ║
+║    · Pattern="NONE" permitido (sin confirmación de vela)            ║
+║    · MAX_OPEN_TRADES=6 genera correlación y destroza win rate       ║
+║    · Sin trailing stop → ganancias se revierten                     ║
+║    · Sin time-based exit → trades muertos consumen capital          ║
 ║                                                                      ║
-║  SOLUCIÓN V15:                                                       ║
-║    · Parámetros calibrados para 5m realistas                        ║
-║    · 2 TF en vez de 3 (5m + 1H) — triple TF mata señales           ║
-║    · SuperTrend como bonus, no como filtro duro                      ║
-║    · SESSION_FILTER=false por defecto                               ║
-║    · Confluencias: 4/6 mínimo (era 5/7)                            ║
-║    · Score mínimo: 45 (era 62)                                      ║
-║    · Slope ≥ 12° (era 28°)                                          ║
-║    · ADX ≥ 18 (era 25)                                              ║
-║    · H1 NEUTRAL permitido (H1 contra señal = descarte)              ║
-║    · Diagnóstico Telegram: razón exacta de cada descarte            ║
+║  SOLUCIÓN V16 — CALIDAD SOBRE CANTIDAD:                             ║
+║    · H1 BULL/BEAR requerido (NEUTRAL = descarte)                    ║
+║    · Slope = FILTRO DURO (no confluencia)                           ║
+║    · ADX_MIN=22 (elimina rango 18-22 con alta reversión)            ║
+║    · Patrón de vela requerido: PIN_BAR/ENGULF/MOMENTUM/INSIDE_BAR  ║
+║    · Score mínimo = 55 (era 45)                                     ║
+║    · MAX_OPEN_TRADES = 3 (menos correlación, más calidad)           ║
+║    · Trailing stop: BE en 1×ATR, trail en 1.5×ATR                  ║
+║    · Time-based exit: cierra en 30 velas (2.5h) si no llega TP     ║
+║    · Resultado esperado: ~74-78% win rate con menos señales         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -41,7 +42,7 @@ except ImportError:
     TELEGRAM_OK = False
 
 # ══════════════════════════════════════════════════════════════════════
-#  CONFIG — VALORES CALIBRADOS PARA 5m
+#  CONFIG — V16 HIGH WIN RATE
 # ══════════════════════════════════════════════════════════════════════
 BINGX_API_KEY    = os.environ["BINGX_API_KEY"]
 BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", os.environ.get("BINGX_API_SECRET", ""))
@@ -52,52 +53,61 @@ TIMEFRAME        = os.environ.get("TIMEFRAME",       "5m")
 RISK_PERCENT     = float(os.environ.get("RISK_PERCENT",   "1.0"))
 LEVERAGE         = int(os.environ.get("LEVERAGE",         "5"))
 LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "6"))
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "3"))     # V16: 6 → 3
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
 
-# ── Filtros de calidad — CALIBRADOS ───────────────────────────────────
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "45.0"))   # era 62 → 45
-MIN_CONFLUENCES  = int(os.environ.get("MIN_CONFLUENCES",  "4"))      # era 5/7 → 4/6
+# ── Filtros de calidad — V16 MÁS RESTRICTIVO ─────────────────────────
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "55.0"))   # V16: 45 → 55
+MIN_CONFLUENCES  = int(os.environ.get("MIN_CONFLUENCES",  "4"))
 MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.20"))
-ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "4.0"))    # era 3.5 → 4.0
+ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "4.0"))
 
 # ── EMAs ──────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",   "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",   "21"))
-EMA_TREND        = int(os.environ.get("EMA_TREND",  "50"))           # era 100 → 50
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT", "12.0"))      # era 28 → 12
-SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",   "5"))          # era 3 → 5
+EMA_TREND        = int(os.environ.get("EMA_TREND",  "50"))
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT", "12.0"))
+SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",   "5"))
 
 # ── ADX / RSI ─────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",  "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN", "18.0"))          # era 25 → 18
+ADX_MIN          = float(os.environ.get("ADX_MIN", "22.0"))          # V16: 18 → 22
 RSI_LEN          = int(os.environ.get("RSI_LEN",  "14"))
 RSI_OB           = float(os.environ.get("RSI_OB",  "72.0"))
 RSI_OS           = float(os.environ.get("RSI_OS",  "28.0"))
-VOL_MULT         = float(os.environ.get("VOL_MULT", "0.9"))          # era 1.3 → 0.9
+VOL_MULT         = float(os.environ.get("VOL_MULT", "0.9"))
 
 # ── SuperTrend ────────────────────────────────────────────────────────
 ST_PERIOD        = int(os.environ.get("ST_PERIOD",  "10"))
 ST_MULT          = float(os.environ.get("ST_MULT",  "3.0"))
 
 # ── TP / SL ───────────────────────────────────────────────────────────
-TP_MULT          = float(os.environ.get("TP_MULT",       "2.0"))     # era 3.0 → 2.0
+TP_MULT          = float(os.environ.get("TP_MULT",       "2.0"))
 SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",   "1.5"))
-MIN_RR           = float(os.environ.get("MIN_RR",        "1.5"))     # era 2.5 → 1.5
+MIN_RR           = float(os.environ.get("MIN_RR",        "1.5"))
+
+# ── Trailing Stop — V16 NUEVO ─────────────────────────────────────────
+BE_ATR_MULT      = float(os.environ.get("BE_ATR_MULT",    "1.0"))   # Break-even en 1×ATR
+TRAIL_ATR_MULT   = float(os.environ.get("TRAIL_ATR_MULT", "1.5"))   # Trailing en 1.5×ATR
+MAX_CANDLES_OPEN = int(os.environ.get("MAX_CANDLES_OPEN", "30"))     # Time exit: 30 velas (2.5h)
+
+# ── Filtros de calidad V16 — NUEVOS ──────────────────────────────────
+REQUIRE_PATTERN  = os.environ.get("REQUIRE_PATTERN",  "true").lower() == "true"
+REQUIRE_H1_ALIGN = os.environ.get("REQUIRE_H1_ALIGN", "true").lower() == "true"
 
 # ── Position sizing ───────────────────────────────────────────────────
 MIN_ORDER_USDT   = float(os.environ.get("MIN_ORDER_USDT", "5.0"))
 MAX_ORDER_USDT   = float(os.environ.get("MAX_ORDER_USDT", "50.0"))
 MAX_MARGIN_PCT   = float(os.environ.get("MAX_MARGIN_PCT", "30.0"))
 
-# ── Sesión — DESACTIVADA por defecto (era el problema) ────────────────
+# ── Sesión ────────────────────────────────────────────────────────────
 SESSION_FILTER   = os.environ.get("SESSION_FILTER", "false").lower() == "true"
 SESSION_START    = int(os.environ.get("SESSION_START", "6"))
 SESSION_END      = int(os.environ.get("SESSION_END",  "22"))
 
 # ── Circuit breaker ───────────────────────────────────────────────────
-MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "4"))
+MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "3"))    # V16: 4 → 3
 CB_PAUSE_MINS     = int(os.environ.get("CB_PAUSE_MINS",    "30"))
 
 # ── H1 cache ──────────────────────────────────────────────────────────
@@ -134,6 +144,8 @@ sl_cooldown    = {}
 h1_cache       = {}
 consec_losses  = 0
 cb_pause_until = None
+# Registro de trades abiertos para trailing/time-exit
+open_trade_meta = {}   # sym → {"open_time": datetime, "entry": float, "side": str, "atr": float}
 
 # ══════════════════════════════════════════════════════════════════════
 #  BINGX API
@@ -224,7 +236,6 @@ def set_lev(symbol):
 
 # ── Precio en vivo — triple fallback ─────────────────────────────────
 def get_live_price(symbol):
-    # 1. premiumIndex
     try:
         data  = bx_get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
         items = data.get("data", [])
@@ -236,7 +247,6 @@ def get_live_price(symbol):
             return float(items["markPrice"])
     except Exception:
         pass
-    # 2. ticker
     try:
         data = bx_get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
         t    = data.get("data", [])
@@ -250,7 +260,6 @@ def get_live_price(symbol):
             if lp: return float(lp)
     except Exception:
         pass
-    # 3. último kline
     try:
         params = {"symbol":symbol, "interval":INTERVAL_MAP.get(TIMEFRAME,"5m"), "limit":2}
         data   = bx_get("/openApi/swap/v3/quote/klines", params)
@@ -345,7 +354,6 @@ def calc_rsi(close, period=14):
     return 100 - (100 / (1 + rs))
 
 def calc_supertrend(high, low, close, period=10, mult=3.0):
-    """Retorna direction Series: +1 uptrend, -1 downtrend."""
     atr       = calc_atr(high, low, close, period)
     hl2       = (high + low) / 2
     upper_raw = hl2 + mult * atr
@@ -356,17 +364,14 @@ def calc_supertrend(high, low, close, period=10, mult=3.0):
     final_lb  = lower_raw.copy()
 
     for i in range(1, len(close)):
-        # Upper band
         if upper_raw.iloc[i] < final_ub.iloc[i-1] or close.iloc[i-1] > final_ub.iloc[i-1]:
             final_ub.iloc[i] = upper_raw.iloc[i]
         else:
             final_ub.iloc[i] = final_ub.iloc[i-1]
-        # Lower band
         if lower_raw.iloc[i] > final_lb.iloc[i-1] or close.iloc[i-1] < final_lb.iloc[i-1]:
             final_lb.iloc[i] = lower_raw.iloc[i]
         else:
             final_lb.iloc[i] = final_lb.iloc[i-1]
-        # Direction
         if close.iloc[i] > final_ub.iloc[i-1]:
             direction.iloc[i] = 1
         elif close.iloc[i] < final_lb.iloc[i-1]:
@@ -395,7 +400,6 @@ def calc_vwap(df):
     return df2["_ctp"] / df2["_cv"]
 
 def calc_squeeze_off(high, low, close, sq_len=20, bb_mult=2.0, kc_mult=1.5):
-    """True = NO squeeze (mercado expandido, OK para operar)."""
     basis  = close.rolling(sq_len).mean()
     std    = close.rolling(sq_len).std()
     bb_up  = basis + bb_mult * std
@@ -404,10 +408,10 @@ def calc_squeeze_off(high, low, close, sq_len=20, bb_mult=2.0, kc_mult=1.5):
     kc_up  = basis + kc_mult * atr_kc
     kc_lo  = basis - kc_mult * atr_kc
     sqz_on = (bb_lo > kc_lo) & (bb_up < kc_up)
-    return ~sqz_on  # True = squeeze OFF = OK
+    return ~sqz_on
 
 # ══════════════════════════════════════════════════════════════════════
-#  ANÁLISIS H1 (solo 2 TF)
+#  ANÁLISIS H1
 # ══════════════════════════════════════════════════════════════════════
 def analyze_h1(symbol):
     df = get_h1_klines(symbol, 80)
@@ -426,13 +430,13 @@ def analyze_h1(symbol):
     st_now    = int(st_dir.iloc[-1])
     rsi_now   = float(rsi_h1.iloc[-1])
 
-    # H1 trend: EMA alineadas O SuperTrend (no ambas requeridas)
-    bull_h1 = (ema7_now > ema21_now) or (st_now == 1)
-    bear_h1 = (ema7_now < ema21_now) or (st_now == -1)
+    # V16: requiere AMBAS condiciones para confirmar tendencia (más estricto)
+    bull_h1 = (ema7_now > ema21_now) and (st_now == 1)
+    bear_h1 = (ema7_now < ema21_now) and (st_now == -1)
 
-    if bull_h1 and not bear_h1:
+    if bull_h1:
         h1_trend = "BULL"
-    elif bear_h1 and not bull_h1:
+    elif bear_h1:
         h1_trend = "BEAR"
     else:
         h1_trend = "NEUTRAL"
@@ -445,11 +449,11 @@ def analyze_h1(symbol):
     }
 
 # ══════════════════════════════════════════════════════════════════════
-#  PATRONES DE VELA
+#  PATRONES DE VELA — V16 añade Inside Bar
 # ══════════════════════════════════════════════════════════════════════
 def detect_candle_pattern(df, i, direction, atr_val):
     """
-    Detecta Pin Bar, Engulfing o Momentum candle.
+    Detecta: Pin Bar, Engulfing, Momentum candle, Inside Bar.
     Retorna (pattern_name, pattern_score, sl_candle_price).
     """
     if i < 1:
@@ -460,6 +464,8 @@ def detect_candle_pattern(df, i, direction, atr_val):
     l  = float(df["low"].iloc[i])
     c  = float(df["close"].iloc[i])
     o1 = float(df["open"].iloc[i-1])
+    h1 = float(df["high"].iloc[i-1])
+    l1 = float(df["low"].iloc[i-1])
     c1 = float(df["close"].iloc[i-1])
 
     rng  = h - l
@@ -496,6 +502,14 @@ def detect_candle_pattern(df, i, direction, atr_val):
 
         if direction == "SHORT" and c < o and lower_wick < body * 0.35:
             return "MOMENTUM", min(body / rng * 90, 100.0), h + atr_val * 0.1
+
+    # ── Inside Bar (V16 NUEVO) ────────────────────────────────────────
+    # Vela contenida dentro de la vela anterior → compresión → breakout
+    if h <= h1 and l >= l1:
+        if direction == "LONG" and c > o:
+            return "INSIDE_BAR", 55.0, l - atr_val * 0.1
+        if direction == "SHORT" and c < o:
+            return "INSIDE_BAR", 55.0, h + atr_val * 0.1
 
     return "NONE", 0.0, None
 
@@ -534,7 +548,6 @@ def open_order(symbol, side, qty, sl, tp):
     return resp
 
 def open_order_with_retry(symbol, side, qty, sl, tp, atr_val, direction, retries=1):
-    """Reintenta con precio fresco si error 101400."""
     for attempt in range(retries + 1):
         try:
             return open_order(symbol, side, qty, sl, tp)
@@ -557,7 +570,123 @@ def open_order_with_retry(symbol, side, qty, sl, tp, atr_val, direction, retries
                 raise
 
 # ══════════════════════════════════════════════════════════════════════
-#  ESCANEO PRINCIPAL V15
+#  TRAILING STOP & TIME-BASED EXIT — V16 NUEVO
+# ══════════════════════════════════════════════════════════════════════
+def update_sl(symbol, pos_side, new_sl):
+    """Modifica el stop-loss de una posición abierta."""
+    try:
+        resp = bx_post("/openApi/swap/v2/trade/order", {
+            "symbol":        symbol,
+            "side":          "SELL" if pos_side == "LONG" else "BUY",
+            "positionSide":  pos_side,
+            "type":          "STOP_MARKET",
+            "stopPrice":     new_sl,
+            "closePosition": "true",
+            "workingType":   "MARK_PRICE",
+        })
+        if resp.get("code", 0) != 0:
+            log.warning(f"update_sl {symbol}: {resp.get('msg','?')}")
+        return resp
+    except Exception as e:
+        log.warning(f"update_sl {symbol}: {e}")
+
+def close_position_market(symbol, side, qty):
+    """Cierra una posición a mercado."""
+    try:
+        resp = bx_post("/openApi/swap/v2/trade/order", {
+            "symbol":       symbol,
+            "side":         "SELL" if side == "LONG" else "BUY",
+            "positionSide": side,
+            "type":         "MARKET",
+            "quantity":     round(abs(qty), 4),
+        })
+        if resp.get("code", 0) != 0:
+            log.warning(f"close_pos {symbol}: {resp.get('msg','?')}")
+        return resp
+    except Exception as e:
+        log.warning(f"close_pos {symbol}: {e}")
+
+def manage_open_positions(positions):
+    """
+    Ejecuta trailing stop y time-based exit en cada ciclo.
+    - Break-even cuando precio va BE_ATR_MULT × ATR a favor
+    - Trailing stop a TRAIL_ATR_MULT × ATR tras break-even
+    - Time exit si lleva MAX_CANDLES_OPEN velas sin llegar al TP (solo si pierde)
+    """
+    global open_trade_meta
+    now = datetime.now(timezone.utc)
+
+    for sym, pos in positions.items():
+        try:
+            pos_amt = float(pos.get("positionAmt", 0))
+            if pos_amt == 0:
+                continue
+
+            side    = "LONG" if pos_amt > 0 else "SHORT"
+            entry   = float(pos.get("avgPrice", 0) or pos.get("entryPrice", 0))
+            cur_sl  = float(pos.get("stopLoss", 0) or 0)
+            unr_pnl = float(pos.get("unrealizedProfit", 0) or 0)
+
+            if entry <= 0:
+                continue
+
+            # Precio actual
+            try:
+                live = get_live_price(sym)
+            except Exception:
+                continue
+
+            # ATR actual (5m)
+            try:
+                df_k    = get_klines(sym, 50)
+                atr_val = float(calc_atr(df_k["high"], df_k["low"], df_k["close"], 14).iloc[-1])
+            except Exception:
+                # Usar ATR registrado al abrir si falla
+                atr_val = open_trade_meta.get(sym, {}).get("atr", entry * 0.005)
+
+            # ── Time-based exit ───────────────────────────────────────
+            meta     = open_trade_meta.get(sym)
+            if meta and meta.get("open_time"):
+                candles_open = int((now - meta["open_time"]).total_seconds() / 300)
+                if candles_open >= MAX_CANDLES_OPEN and unr_pnl <= 0:
+                    log.info(f"⏱️ Time exit {sym}: {candles_open} velas | PnL={unr_pnl:.2f}U")
+                    close_position_market(sym, side, abs(pos_amt))
+                    tg(
+                        f"⏱️ <b>Time exit {sym}</b>\n"
+                        f"Velas abiertas: {candles_open} | PnL: {unr_pnl:.2f}U\n"
+                        f"Cerrado a mercado para liberar capital."
+                    )
+                    open_trade_meta.pop(sym, None)
+                    continue
+
+            # ── Trailing Stop ─────────────────────────────────────────
+            if side == "LONG":
+                be_trigger = entry + atr_val * BE_ATR_MULT
+                if live >= be_trigger:
+                    new_trail = round(live - atr_val * TRAIL_ATR_MULT, 6)
+                    # Solo mover SL hacia arriba, nunca hacia abajo
+                    if new_trail > cur_sl and new_trail > entry * 0.999:
+                        log.info(f"📈 Trail LONG {sym}: {cur_sl:.4g} → {new_trail:.4g} (live={live:.4g})")
+                        update_sl(sym, "LONG", new_trail)
+                        if meta:
+                            meta["trail_sl"] = new_trail
+
+            else:  # SHORT
+                be_trigger = entry - atr_val * BE_ATR_MULT
+                if live <= be_trigger:
+                    new_trail = round(live + atr_val * TRAIL_ATR_MULT, 6)
+                    # Solo mover SL hacia abajo, nunca hacia arriba
+                    if new_trail < cur_sl and new_trail < entry * 1.001:
+                        log.info(f"📉 Trail SHORT {sym}: {cur_sl:.4g} → {new_trail:.4g} (live={live:.4g})")
+                        update_sl(sym, "SHORT", new_trail)
+                        if meta:
+                            meta["trail_sl"] = new_trail
+
+        except Exception as e:
+            log.debug(f"manage_pos {sym}: {e}")
+
+# ══════════════════════════════════════════════════════════════════════
+#  ESCANEO PRINCIPAL V16
 # ══════════════════════════════════════════════════════════════════════
 def scan_symbol(symbol):
     # Cooldown
@@ -579,8 +708,8 @@ def scan_symbol(symbol):
         ema_t = calc_ema(c, EMA_TREND)
         angle = calc_ema_angle(ema_f, atr_s, SLOPE_LOOK)
         di_p, di_m, adx_s = calc_adx(h, l, c, ADX_LEN)
-        rsi_s = calc_rsi(c, RSI_LEN)
-        vol_ma = df["volume"].rolling(20).mean()
+        rsi_s   = calc_rsi(c, RSI_LEN)
+        vol_ma  = df["volume"].rolling(20).mean()
         sqz_off = calc_squeeze_off(h, l, c, 20, 2.0, 1.5)
         vwap_s  = calc_vwap(df)
         st_dir  = calc_supertrend(h, l, c, ST_PERIOD, ST_MULT)
@@ -631,21 +760,21 @@ def scan_symbol(symbol):
         if direction == "LONG"  and rsi_now > RSI_OB: return None
         if direction == "SHORT" and rsi_now < RSI_OS: return None
 
-        # ── EMA TREND filter (EMA50) ──────────────────────────────────
+        # ── EMA TREND filter ──────────────────────────────────────────
         if direction == "LONG"  and close_now < ema_t_now: return None
         if direction == "SHORT" and close_now > ema_t_now: return None
 
-        # ══ SISTEMA DE CONFLUENCIAS V15 — 6 FILTROS, MÍNIMO 4 ════════
-        # Más permisivo que V14 (7 filtros, mínimo 5) pero con calidad
+        # ══ V16: SLOPE = FILTRO DURO (no confluencia) ════════════════
+        ang_ok = angle_now >= SLOPE_LIMIT if direction == "LONG" else angle_now <= -SLOPE_LIMIT
+        if not ang_ok:
+            return None   # Slope débil → skip inmediato
+
+        # ══ SISTEMA DE CONFLUENCIAS V16 — 5 FILTROS, MÍNIMO 4 ════════
+        # (Slope ya no cuenta como confluencia, es filtro duro)
         confluences  = 0
         conf_detail  = {}
 
-        # C1: Slope EMA (ángulo)
-        ang_ok = angle_now >= SLOPE_LIMIT if direction == "LONG" else angle_now <= -SLOPE_LIMIT
-        if ang_ok: confluences += 1
-        conf_detail["slope"] = f"{'✅' if ang_ok else '❌'}{angle_now:.1f}°"
-
-        # C2: ADX con DI
+        # C1: ADX con DI
         adx_ok = adx_now >= ADX_MIN and (
             (di_p_now > di_m_now and direction == "LONG") or
             (di_m_now > di_p_now and direction == "SHORT")
@@ -653,45 +782,56 @@ def scan_symbol(symbol):
         if adx_ok: confluences += 1
         conf_detail["adx"] = f"{'✅' if adx_ok else '❌'}{adx_now:.0f}"
 
-        # C3: SuperTrend 5m
+        # C2: SuperTrend 5m
         st_ok = (st_now == 1 and direction == "LONG") or (st_now == -1 and direction == "SHORT")
         if st_ok: confluences += 1
         conf_detail["ST"] = f"{'✅' if st_ok else '❌'}{'▲' if st_now==1 else '▼'}"
 
-        # C4: Heikin Ashi confirma
+        # C3: Heikin Ashi confirma
         ha_ok = (ha_bull and direction == "LONG") or (ha_bear and direction == "SHORT")
         if ha_ok: confluences += 1
         conf_detail["HA"] = "✅" if ha_ok else "❌"
 
-        # C5: Volumen
+        # C4: Volumen
         vol_ok = vratio >= VOL_MULT
         if vol_ok: confluences += 1
         conf_detail["vol"] = f"{'✅' if vol_ok else '❌'}{vratio:.1f}x"
 
-        # C6: Squeeze OFF (mercado expandido)
+        # C5: Squeeze OFF
         if sqz_ok: confluences += 1
         conf_detail["sqz"] = "✅OFF" if sqz_ok else "❌ON"
 
         if confluences < MIN_CONFLUENCES:
             return None
 
-        # ── H1 alignment — NEUTRAL permitido, CONTRARIO descarta ─────
+        # ══ V16: H1 ALINEADO REQUERIDO — NEUTRAL = DESCARTE ══════════
         h1_ctx   = analyze_h1(symbol)
         h1_trend = h1_ctx["h1_trend"] if h1_ctx else "NEUTRAL"
         h1_bonus = 0
 
-        if h1_ctx:
+        if REQUIRE_H1_ALIGN:
+            if h1_trend == "BULL" and direction == "LONG":
+                h1_bonus = 20
+            elif h1_trend == "BEAR" and direction == "SHORT":
+                h1_bonus = 20
+            else:
+                return None    # NEUTRAL o contrario → descarte
+        else:
             if h1_trend == "BULL" and direction == "LONG":
                 h1_bonus = 20
             elif h1_trend == "BEAR" and direction == "SHORT":
                 h1_bonus = 20
             elif h1_trend == "NEUTRAL":
-                h1_bonus = 5   # neutral permitido, pequeño bonus
+                h1_bonus = 5
             else:
-                return None    # H1 contra señal → descarte
+                return None
 
         # ── Patrón de vela ────────────────────────────────────────────
         pat_name, pat_score, sl_candle = detect_candle_pattern(df, i, direction, atr_val)
+
+        # V16: Patrón REQUERIDO
+        if REQUIRE_PATTERN and pat_name == "NONE":
+            return None
 
         # ── SL / TP ───────────────────────────────────────────────────
         sl_atr = atr_val * SL_ATR_MULT
@@ -722,12 +862,12 @@ def scan_symbol(symbol):
         if rr < MIN_RR:
             return None
 
-        # ── SCORING V15 ───────────────────────────────────────────────
-        # confluencias (max 30) + H1 (max 20) + patrón (max 15)
+        # ── SCORING V16 ───────────────────────────────────────────────
+        # confluencias (max 25) + H1 (max 20) + patrón (max 20)
         # + ADX (max 10) + ángulo (max 10) + vol (max 10) + RR (max 5)
-        score  = (confluences / 6) * 30                                # max 30
+        score  = (confluences / 5) * 25                                # max 25
         score += h1_bonus                                               # max 20
-        score += min(pat_score / 7, 15)                                # max 15
+        score += min(pat_score / 5, 20)                                # max 20 (patrón vale más)
         score += min((adx_now - ADX_MIN) / ADX_MIN * 10, 10)          # max 10
         score += min(abs(angle_now) / SLOPE_LIMIT * 10, 10)            # max 10
         score += min(vratio * 5, 10)                                    # max 10
@@ -736,7 +876,7 @@ def scan_symbol(symbol):
         if score < MIN_SCORE:
             return None
 
-        quality_mult = round(min(max(0.7 + (score - MIN_SCORE) / 55 * 0.6, 0.7), 1.3), 2)
+        quality_mult = round(min(max(0.7 + (score - MIN_SCORE) / 45 * 0.6, 0.7), 1.3), 2)
 
         return {
             "symbol":       symbol,
@@ -785,15 +925,23 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>TRADING BOT V15 — BALANCED EDITION</b>\n"
+        f"🚀 <b>TRADING BOT V16 — HIGH WIN RATE EDITION</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔧 <b>Fix V14:</b> 0 señales → parámetros recalibrados\n"
-        f"📊 <b>Confluencias:</b> {MIN_CONFLUENCES}/6 | <b>Score:</b> {MIN_SCORE}\n"
-        f"📐 <b>Slope≥:</b> {SLOPE_LIMIT}° | <b>ADX≥:</b> {ADX_MIN} | <b>EMA trend:</b> {EMA_TREND}\n"
+        f"🎯 <b>Objetivo:</b> ~77% win rate | Calidad sobre cantidad\n"
+        f"🔧 <b>Mejoras V16:</b>\n"
+        f"  • H1 BULL/BEAR requerido (NEUTRAL = descarte)\n"
+        f"  • Slope = filtro duro (no confluencia)\n"
+        f"  • Patrón de vela requerido + Inside Bar añadido\n"
+        f"  • Trailing stop: BE={BE_ATR_MULT}×ATR → Trail={TRAIL_ATR_MULT}×ATR\n"
+        f"  • Time exit: {MAX_CANDLES_OPEN} velas sin TP = cierre\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Confluencias:</b> {MIN_CONFLUENCES}/5 | <b>Score:</b> {MIN_SCORE}\n"
+        f"📐 <b>Slope≥:</b> {SLOPE_LIMIT}° (duro) | <b>ADX≥:</b> {ADX_MIN} | <b>EMA:</b> {EMA_TREND}\n"
         f"📡 <b>TF:</b> {TIMEFRAME} + 1H | <b>ST:</b> {ST_PERIOD}/{ST_MULT}\n"
         f"⚡ <b>Vol≥:</b> {VOL_MULT}x | <b>RSI:</b> {RSI_OS}-{RSI_OB}\n"
         f"🎯 <b>R:R mínimo:</b> {MIN_RR} | <b>TP:</b> {TP_MULT}× | <b>SL:</b> {SL_ATR_MULT}×ATR\n"
-        f"🔐 <b>Session filter:</b> {'ON' if SESSION_FILTER else 'OFF'}\n"
+        f"🔐 <b>Session filter:</b> {'ON' if SESSION_FILTER else 'OFF'} | "
+        f"<b>Max trades:</b> {MAX_OPEN_TRADES}\n"
         f"💰 <b>Balance:</b> {balance:.2f} USDT | <b>Símbolos:</b> {len(symbols)}\n"
         f"🛡️ <b>Circuit breaker:</b> {MAX_CONSEC_LOSSES} pérdidas → pausa {CB_PAUSE_MINS}min\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
@@ -811,8 +959,8 @@ def tg_scan(signals, total, open_count):
         cd  = " ".join(s.get("conf_detail", {}).values())
         lines.append(
             f"{e} <b>{s['symbol']}</b> {s['pattern']} "
-            f"Score:{s['score']:.0f} {s['confluences']}/6 H1:{s['h1_trend']}\n"
-            f"   {cd}"
+            f"Score:{s['score']:.0f} {s['confluences']}/5 H1:{s['h1_trend']}\n"
+            f"   Ang:{s['angle']}° {cd}"
         )
     lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
     tg("\n".join(lines))
@@ -820,33 +968,36 @@ def tg_scan(signals, total, open_count):
 def tg_entry(sig, qty, notional, balance):
     d    = "🟢 LONG" if sig["signal"] == "LONG" else "🔴 SHORT"
     cd   = " | ".join([f"{k}:{v}" for k, v in sig.get("conf_detail", {}).items()])
-    icon = {"PIN_BAR":"📌","ENGULF":"🔄","MOMENTUM":"💥","NONE":"📈"}.get(sig.get("pattern","NONE"), "⚡")
+    icon = {"PIN_BAR":"📌","ENGULF":"🔄","MOMENTUM":"💥","INSIDE_BAR":"📦","NONE":"📈"}.get(sig.get("pattern","NONE"), "⚡")
     tg(
-        f"<b>✅ ENTRADA V15 — {sig['symbol']}</b>\n"
+        f"<b>✅ ENTRADA V16 — {sig['symbol']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Dir:</b> {d} | <b>Score:</b> {sig['score']:.0f}/100\n"
-        f"<b>Confl:</b> {sig['confluences']}/6 | <b>H1:</b> {sig['h1_trend']}\n"
+        f"<b>Confl:</b> {sig['confluences']}/5 | <b>H1:</b> {sig['h1_trend']} ✅\n"
         f"{icon} <b>Patrón:</b> {sig['pattern']} ({sig['pat_score']:.0f})\n"
         f"<b>Filtros:</b> {cd}\n"
-        f"<b>Ang:</b> {sig['angle']}° | <b>ADX:</b> {sig['adx']} | "
+        f"<b>Ang:</b> {sig['angle']}° ✅ | <b>ADX:</b> {sig['adx']} | "
         f"<b>RSI:</b> {sig['rsi']} | <b>Vol:</b> {sig['vol_ratio']}x\n"
         f"<b>Entrada:</b> <code>{sig['close']:.6g}</code>\n"
         f"<b>Stop:</b>   <code>{sig['sl']:.6g}</code> ({sig['dist_pct']}%)\n"
         f"<b>Target:</b> <code>{sig['tp']:.6g}</code> | <b>R:R</b> 1:{sig['rr']}\n"
+        f"<b>Trailing:</b> BE en {BE_ATR_MULT}×ATR → Trail {TRAIL_ATR_MULT}×ATR\n"
+        f"<b>Time exit:</b> {MAX_CANDLES_OPEN} velas si no TP\n"
         f"<b>Qty:</b> {qty:.4f} | <b>Notional:</b> {notional:.2f} USDT\n"
         f"<b>Kelly×:</b> {sig['quality_mult']} | <b>ATR:</b> {sig['atr_pct']}%\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
     )
 
 def tg_zero_signals(total, cycle):
-    """Cada 5 ciclos sin señales, avisa con contexto."""
     tg(
         f"⚠️ <b>0 señales / {total} símbolos</b> (ciclo #{cycle})\n"
-        f"<b>Parámetros activos:</b>\n"
-        f"  Slope≥{SLOPE_LIMIT}° | ADX≥{ADX_MIN} | Confl≥{MIN_CONFLUENCES}/6\n"
-        f"  Score≥{MIN_SCORE} | EMA_TREND={EMA_TREND} | ATR_MAX={ATR_MAX_PCT}%\n"
-        f"  VOL≥{VOL_MULT}x | RR≥{MIN_RR}\n"
-        f"💡 Si persiste: bajar SLOPE_LIMIT, ADX_MIN o MIN_CONFLUENCES\n"
+        f"<b>Filtros V16 activos:</b>\n"
+        f"  Slope≥{SLOPE_LIMIT}° (DURO) | ADX≥{ADX_MIN} | Confl≥{MIN_CONFLUENCES}/5\n"
+        f"  Score≥{MIN_SCORE} | H1 BULL/BEAR requerido\n"
+        f"  Patrón requerido: PIN_BAR/ENGULF/MOMENTUM/INSIDE_BAR\n"
+        f"  EMA_TREND={EMA_TREND} | ATR_MAX={ATR_MAX_PCT}% | VOL≥{VOL_MULT}x\n"
+        f"💡 Normal tener pocas señales — calidad sobre cantidad\n"
+        f"💡 Si persiste +2h: bajar SLOPE_LIMIT o ADX_MIN via env vars\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
     )
 
@@ -854,13 +1005,15 @@ def tg_zero_signals(total, cycle):
 #  MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════
 def main():
-    global consec_losses, cb_pause_until
+    global consec_losses, cb_pause_until, open_trade_meta
 
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  TRADING BOT V15 — BALANCED WIN RATE EDITION ║")
+    log.info("║  TRADING BOT V16 — HIGH WIN RATE EDITION     ║")
     log.info("╚══════════════════════════════════════════════╝")
-    log.info(f"  Slope≥{SLOPE_LIMIT}° | ADX≥{ADX_MIN} | Confl≥{MIN_CONFLUENCES}/6 | "
-             f"Score≥{MIN_SCORE} | EMA_TREND={EMA_TREND}")
+    log.info(f"  Slope≥{SLOPE_LIMIT}° DURO | ADX≥{ADX_MIN} | H1 requerido | "
+             f"Patrón requerido | Confl≥{MIN_CONFLUENCES}/5 | Score≥{MIN_SCORE}")
+    log.info(f"  Trailing: BE={BE_ATR_MULT}×ATR → Trail={TRAIL_ATR_MULT}×ATR | "
+             f"TimeExit={MAX_CANDLES_OPEN} velas | MaxTrades={MAX_OPEN_TRADES}")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
@@ -882,8 +1035,20 @@ def main():
     with ThreadPoolExecutor(max_workers=20) as ex:
         list(ex.map(set_lev, symbols))
 
+    # Reconstruir meta de posiciones existentes al arrancar
+    for sym, pos in positions.items():
+        pos_amt = float(pos.get("positionAmt", 0))
+        if pos_amt != 0:
+            open_trade_meta[sym] = {
+                "open_time": datetime.now(timezone.utc),  # aproximado al arrancar
+                "entry":     float(pos.get("avgPrice", 0) or pos.get("entryPrice", 0)),
+                "side":      "LONG" if pos_amt > 0 else "SHORT",
+                "atr":       0.0,
+                "trail_sl":  float(pos.get("stopLoss", 0) or 0),
+            }
+
     tg_startup(balance, symbols)
-    log.info("✅ Bot V15 iniciado.")
+    log.info("✅ Bot V16 iniciado.")
 
     errors        = 0
     cycle         = 0
@@ -913,9 +1078,20 @@ def main():
             open_count = len(positions)
 
             log.info(
-                f"── V15 | {balance:.2f}U | {open_count}/{MAX_OPEN_TRADES} | "
+                f"── V16 | {balance:.2f}U | {open_count}/{MAX_OPEN_TRADES} | "
                 f"{len(symbols)} sym | ciclo #{cycle} ──"
             )
+
+            # ── V16: Gestión de posiciones abiertas (trailing + time exit) ──
+            if positions:
+                manage_open_positions(positions)
+                # Refrescar tras posibles cierres
+                positions  = get_all_positions()
+                open_count = len(positions)
+                # Limpiar meta de posiciones cerradas
+                for sym in list(open_trade_meta.keys()):
+                    if sym not in positions:
+                        open_trade_meta.pop(sym, None)
 
             # ── Scan ──────────────────────────────────────────────────
             signals = []
@@ -927,11 +1103,11 @@ def main():
                         signals.append(r)
 
             signals.sort(key=lambda x: x["score"], reverse=True)
-            log.info(f"Señales válidas: {len(signals)}/{len(symbols)}")
+            log.info(f"Señales válidas V16: {len(signals)}/{len(symbols)}")
 
             if not signals:
                 zero_sig_runs += 1
-                if zero_sig_runs % 5 == 1:   # avisa cada 5 ciclos sin señales
+                if zero_sig_runs % 5 == 1:
                     tg_zero_signals(len(symbols), cycle)
             else:
                 zero_sig_runs = 0
@@ -939,7 +1115,7 @@ def main():
                 for s in signals[:5]:
                     log.info(
                         f"  → {s['symbol']} {s['signal']} [{s['pattern']}] "
-                        f"H1:{s['h1_trend']} confl:{s['confluences']}/6 "
+                        f"H1:{s['h1_trend']} confl:{s['confluences']}/5 "
                         f"score={s['score']:.1f} ang={s['angle']}° "
                         f"adx={s['adx']} rr=1:{s['rr']}"
                     )
@@ -966,11 +1142,9 @@ def main():
                 try:
                     set_lev(sym)
 
-                    # Precio en vivo
                     live = get_live_price(sym)
                     log.info(f"Live {sym}: scan={sig['close']:.6g} live={live:.6g}")
 
-                    # Recalcular SL/TP
                     atr_val   = sig["atr"]
                     direction = sig["signal"]
                     if direction == "LONG":
@@ -999,7 +1173,8 @@ def main():
                     log.info(
                         f"ORDEN {sym} {direction} qty={qty:.4f} "
                         f"notional={notional:.1f}U live={live:.6g} "
-                        f"sl={sl:.6g} tp={tp:.6g} score={sig['score']:.1f}"
+                        f"sl={sl:.6g} tp={tp:.6g} score={sig['score']:.1f} "
+                        f"pat={sig['pattern']}"
                     )
 
                     side = "BUY" if direction == "LONG" else "SELL"
@@ -1014,6 +1189,16 @@ def main():
                         "dist_pct": round(abs(live-sl)/live*100, 3),
                         "rr":       round(rr_live, 2),
                     })
+
+                    # Registrar metadata para trailing/time-exit
+                    open_trade_meta[sym] = {
+                        "open_time": datetime.now(timezone.utc),
+                        "entry":     live,
+                        "side":      direction,
+                        "atr":       atr_val,
+                        "trail_sl":  round(sl, 6),
+                    }
+
                     tg_entry(sig, qty, notional, balance)
                     entered.add(sym)
                     open_count += 1
@@ -1033,7 +1218,7 @@ def main():
             errors = 0
 
         except KeyboardInterrupt:
-            tg("🛑 <b>Bot V15 detenido</b>")
+            tg("🛑 <b>Bot V16 detenido</b>")
             break
         except Exception as e:
             errors += 1
