@@ -96,7 +96,8 @@ class RiskManager:
     # ─── Position Sizing ──────────────────────────────────────────────────────
 
     def calculate_size(self, balance: float, entry: float,
-                       sl: float, confluence: int) -> float:
+                       sl: float, confluence: int,
+                       risk_override: float = None) -> float:
         """
         Sizing adaptativo basado en confluence score:
         - Score 60-74:  1x risk
@@ -116,7 +117,8 @@ class RiskManager:
         if sl_distance <= 0:
             return 0.0
 
-        risk_usdt  = balance * RISK_PER_TRADE * risk_mult
+        base_risk  = risk_override if risk_override is not None else RISK_PER_TRADE
+        risk_usdt  = balance * base_risk * risk_mult
         # quantity = cuántos contratos necesito para que si el precio baja sl_distance
         # pierda exactamente risk_usdt
         quantity = (risk_usdt / sl_distance)
