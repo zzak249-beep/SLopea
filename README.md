@@ -1,193 +1,168 @@
-# ⚡ SAMA APEX Bot v1.0
-> Bot de trading algorítmico para BingX Perpetual Futures  
-> Basado en el indicador MZ SAMA V4: Sovereign Apex (Pine Script v6)
+# QF Machine × JP Fusion Bot v3 🤖
+
+Bot de trading algorítmico para criptomonedas. Porta la lógica del indicador Pine Script (12 capas) a Python para operar en BingX con señales en Telegram.
+
+> ⚠️ **PAPER MODE activo por defecto.** El bot NO opera con dinero real hasta que cambies `PAPER_MODE=false` explícitamente.
 
 ---
 
-## 🧠 ¿Qué hace este bot?
-
-Port completo del indicador SAMA a un bot de trading autónomo:
-
-| Componente | Descripción |
-|---|---|
-| **AMA** | Adaptive Moving Average (port exacto del Pine Script) |
-| **Slope Engine** | Cálculo de ángulo en grados para clasificar tendencia |
-| **Multi-TF** | Alineación de 3 timeframes simultáneos |
-| **RVOL** | Filtro de volumen relativo (evita señales en baja liquidez) |
-| **ATR Bands** | TP/SL dinámicos basados en bandas ATR del indicador |
-
-## 🔥 Edge Especial (ventaja sobre otros bots)
-
-1. **Confluence Score (0-100)**: No opera si no hay calidad suficiente en la señal. Ponderación de: alineación TF + fuerza de slope + RVOL + sesión + funding rate.
-
-2. **Funding Rate Filter**: Detecta funding extremo. Si el mercado está muy cargado en una dirección, penaliza esa dirección o la favorece si coincide con el fade.
-
-3. **Session Filter**: Solo opera en sesiones London (7-16 UTC) y NY (13-21 UTC), donde la liquidez es real. Elimina la mayoría de señales falsas de Asia.
-
-4. **Adaptive Position Sizing**: El tamaño varía según el confluence score:
-   - Score 60-74 → 1.0x risk
-   - Score 75-89 → 1.25x risk
-   - Score 90-100 → 1.5x risk
-
-5. **Trailing Stop ATR**: Una vez en profit de 1 ATR, mueve el SL automáticamente protegiendo ganancias.
-
-6. **Circuit Breaker**: Si el bot pierde más del X% en un día, para completamente hasta el día siguiente.
-
-7. **Multi-Symbol Scanner**: Escanea hasta 10 pares simultáneamente y prioriza el que tenga mayor confluence score.
-
----
-
-## 📁 Estructura del Proyecto
+## 🏗 Arquitectura
 
 ```
-sama-apex-bot/
-├── bot.py               # Loop principal y orquestador
-├── config.py            # Todos los parámetros (ENV vars)
-├── indicators.py        # AMA, Slope, ATR, RVOL, Confluence Score
-├── signal_engine.py     # Generación de señales multi-TF
-├── bingx_client.py      # Cliente REST para BingX Perpetual Futures
-├── risk_manager.py      # Sizing, trailing stop, circuit breaker
-├── telegram_notifier.py # Alertas y notificaciones
-├── requirements.txt
-├── Procfile             # Para Railway
-├── railway.toml         # Configuración Railway
-├── .env.example         # Variables de entorno (template)
-└── .gitignore
+src/
+├── main.py          ← Orquestador principal (loop de trading)
+├── signals.py       ← Motor de señales (12 capas, port del Pine Script)
+├── exchange.py      ← Conector BingX REST API
+├── risk.py          ← Gestión de riesgo y circuit breakers
+├── positions.py     ← Tracker de posiciones abiertas
+├── telegram_bot.py  ← Bot de Telegram (señales + comandos)
+├── config.py        ← Todos los parámetros configurables
+└── backtest.py      ← Backtester sobre datos históricos CSV
 ```
 
 ---
 
-## 🚀 Setup: Paso a Paso
+## ⚡ Setup rápido (Railway)
 
-### 1. Requisitos previos
-- Cuenta BingX con API Key habilitada para Futures
-- Bot de Telegram (crear con @BotFather)
-- Cuenta Railway (railway.app)
+### 1. Fork / sube a GitHub
 
-### 2. Clonar y configurar localmente
 ```bash
-git clone https://github.com/TU_USUARIO/sama-apex-bot.git
-cd sama-apex-bot
+git init
+git add .
+git commit -m "QF Bot v3 initial"
+git remote add origin https://github.com/TU_USUARIO/qf-bot.git
+git push -u origin main
+```
 
-# Crear entorno virtual
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate   # Windows
+### 2. Crea proyecto en Railway
 
+1. railway.app → New Project → Deploy from GitHub
+2. Selecciona tu repo
+3. Railway detecta el `Dockerfile` automáticamente
+
+### 3. Variables de entorno en Railway
+
+En tu proyecto → **Variables** → añade:
+
+| Variable | Valor |
+|---|---|
+| `BINGX_API_KEY` | Tu API key de BingX |
+| `BINGX_SECRET` | Tu secret de BingX |
+| `TELEGRAM_TOKEN` | Token de @BotFather |
+| `TELEGRAM_CHAT_ID` | Tu Chat ID (ver abajo) |
+| `PAPER_MODE` | `true` (¡no cambies hasta validar!) |
+| `MIN_CONVICTION` | `6` |
+| `LOOP_SECONDS` | `30` |
+| `TRAIL_ATR` | `1.5` |
+
+### 4. Obtener API Keys de BingX
+
+1. BingX → Cuenta → Gestión de API
+2. Crear API → habilitar **Futuros Perpetuos**
+3. Habilitar: Lectura ✅ | Trading ✅ | Retiro ❌ (NUNCA)
+4. IP whitelist: añade la IP de tu servidor Railway (opcional pero recomendado)
+
+### 5. Obtener Telegram Token y Chat ID
+
+```bash
+# 1. Habla con @BotFather → /newbot → sigue instrucciones → guarda el token
+
+# 2. Obtén tu Chat ID:
+curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
+# Manda un mensaje a tu bot y busca "chat":{"id": XXXX}
+```
+
+---
+
+## 🧪 Backtest antes de operar
+
+```bash
+# Instalar dependencias
 pip install -r requirements.txt
 
-# Copiar y editar .env
-cp .env.example .env
-# Editar .env con tus keys
+# Descargar datos históricos de BingX (CSV)
+# o exportar desde TradingView: Símbolo → Exportar datos CSV
+
+# Ejecutar backtest
+python src/backtest.py \
+  --file3m  datos/BTCUSDT_3m.csv \
+  --conviction 6 \
+  --out logs/bt_result.json
+
+# Resultado:
+# ══════════════════════════════════════════
+#   total_trades     : 87
+#   win_rate_pct     : 58.6
+#   total_pnl        : +234.50
+#   max_drawdown_pct : 8.2
+#   profit_factor    : 1.74
+# ══════════════════════════════════════════
 ```
 
-### 3. Obtener Telegram Chat ID
-```
-1. Crea un bot con @BotFather → obtienes TELEGRAM_TOKEN
-2. Envía un mensaje al bot
-3. Visita: https://api.telegram.org/bot<TOKEN>/getUpdates
-4. Copia el "chat" → "id"
-```
+**Criterios mínimos para pasar a paper trading:**
+- Win rate > 50%
+- Profit factor > 1.3
+- Max drawdown < 15%
 
-### 4. BingX API Key
-```
-1. BingX → Perfil → API Management
-2. Crear API Key
-3. Permisos: Read + Trade (NO Withdraw)
-4. Whitelist de IPs: Railway IP o dejar vacío
-```
-
-### 5. Probar localmente
-```bash
-python bot.py
-```
-
-### 6. Deploy en Railway
-```bash
-# Instalar Railway CLI
-npm install -g @railway/cli
-
-railway login
-railway init
-railway up
-
-# Variables de entorno en Railway Dashboard:
-# Settings → Variables → añadir todas las del .env.example
-```
-
-### 7. Variables Railway obligatorias
-```
-BINGX_API_KEY
-BINGX_SECRET_KEY
-TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID
-SYMBOLS
-```
+**Criterios mínimos para pasar a live:**
+- Paper trading rentable durante ≥ 3 semanas
+- Al menos 30 operaciones en paper
+- Win rate estable > 52%
 
 ---
 
-## ⚙️ Parámetros Clave
+## 📱 Comandos Telegram
 
-### Risk Management
-| Variable | Default | Descripción |
+| Comando | Función |
+|---|---|
+| `/start` | Panel principal con botones |
+| `/status` | Equity, PnL, drawdown, circuit breaker |
+| `/pause` | Detiene nuevas entradas (posiciones abiertas siguen) |
+| `/resume` | Reanuda el bot |
+| `/reset` | Desbloquea circuit breaker manualmente |
+| `/mode` | Muestra modo paper vs live |
+| `/help` | Lista de comandos |
+
+---
+
+## 🛡 Gestión de Riesgo (config.py)
+
+| Parámetro | Default | Descripción |
 |---|---|---|
-| `LEVERAGE` | 5 | Apalancamiento (recomendado: 3-10x) |
-| `RISK_PER_TRADE` | 0.01 | 1% del balance por trade |
-| `MAX_OPEN_TRADES` | 3 | Máximo posiciones simultáneas |
-| `DAILY_LOSS_LIMIT` | 0.05 | Circuit breaker: -5% del día |
-| `MIN_CONFLUENCE` | 60 | Score mínimo para entrar |
+| `leverage` | 5x | Apalancamiento (empieza con 3-5x) |
+| `risk_pct_suprema` | 1.5% | Riesgo por op. señal SUPREMA |
+| `risk_pct_fuel` | 1.0% | Riesgo por op. señal FUEL |
+| `risk_pct_std` | 0.5% | Riesgo por op. señal STD |
+| `max_daily_loss_pct` | 3% | Circuit breaker diario |
+| `max_drawdown_pct` | 15% | Circuit breaker permanente |
+| `max_consecutive_losses` | 4 | Pause tras N pérdidas seguidas |
+| `max_daily_trades` | 10 | Máximo trades por día |
 
-### Timeframes (Estrategia por defecto)
-| Variable | Default | Rol |
+---
+
+## 📊 Señales — Niveles de calidad
+
+| Tier | Condición | Emoji Telegram |
 |---|---|---|
-| `TF_LOCAL` | 5m | Entrada (detección de señal) |
-| `TF_MACRO_1` | 15m | Filtro intermedio |
-| `TF_MACRO_2` | 1h | Filtro macro (tendencia principal) |
+| **SUPREMA** | FUEL + Dark Pool ó CVD div. | ⭐⭐⭐ |
+| **FUEL** | STD + TL break ó Squeeze ó FVG/OB + CVD | 🔥 |
+| **STD** | 6 capas base alineadas | ▶️ |
 
-### Alternativas de configuración probadas
-```bash
-# Scalping agresivo
-TF_LOCAL=1m, TF_MACRO_1=5m, TF_MACRO_2=15m
-
-# Swing conservador
-TF_LOCAL=15m, TF_MACRO_1=1h, TF_MACRO_2=4h
-
-# Balance (recomendado)
-TF_LOCAL=5m, TF_MACRO_1=15m, TF_MACRO_2=1h
-```
+Con `MIN_CONVICTION=6` sólo se ejecutan señales con ≥6/10 filtros activos.
 
 ---
 
-## 📊 Lógica de Señal
+## 🔧 Ajustes recomendados por capital
 
-```
-LONG cuando:
-  ✅ SAMA local en tendencia BULL (slope > flat_threshold)
-  ✅ SAMA 15m en tendencia BULL
-  ✅ SAMA 1h en tendencia BULL
-  ✅ RVOL > 1.2x (volumen por encima de media)
-  ✅ Cambio de estado (no repetir señal ya activa)
-  ✅ Confluence score ≥ MIN_CONFLUENCE
-
-SHORT: mismo pero BEAR
-```
-
----
-
-## 📩 Mensajes Telegram
-
-El bot envía alertas para:
-- 🚀 Señal nueva con análisis completo (confluence, slopes, funding, sesión)
-- 🟢/🔴 Trade abierto (entry, SL, TP, qty)
-- ✅/❌ Trade cerrado (PnL real)
-- 🔄 Trailing stop actualizado
-- 🚨 Circuit breaker activado
-- 📊 Resumen diario al abrir el día nuevo
+| Capital | Leverage | Risk/op | Símbolos |
+|---|---|---|---|
+| < $500 | 3x | 0.5% / 0.8% / 1.2% | 1 (BTC) |
+| $500-2K | 5x | 0.5% / 1.0% / 1.5% | 1-2 |
+| $2K-10K | 5-10x | 0.3% / 0.8% / 1.2% | 2-3 |
+| > $10K | Consult. prof. | < 0.5% | 2-4 |
 
 ---
 
 ## ⚠️ Disclaimer
 
-Este bot opera con dinero real. Úsalo bajo tu propio riesgo.  
-Empieza con **RISK_PER_TRADE=0.005** (0.5%) hasta validar el rendimiento.  
-Ningún bot garantiza rentabilidad. Los mercados de crypto son altamente volátiles.
+Este software es una herramienta de automatización. El trading de futuros de criptomonedas conlleva riesgo de pérdida total del capital. Valida siempre en paper trading antes de usar dinero real. El autor no es responsable de pérdidas.
