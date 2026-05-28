@@ -8,11 +8,11 @@
 
 require('dotenv').config();
 const { CronJob }        = require('cron');
-const logger             = require('./utils/logger');
-const telegram           = require('./telegram/bot');
-const scanner            = require('./signals/scanner');
-const TradeController    = require('./signals/tradeController');
-const bingx              = require('./exchange/bingx');
+const logger             = require('./logger');
+const telegram           = require('./bot');
+const scanner            = require('./scanner');
+const TradeController    = require('./tradeController');
+const bingx              = require('./bingx');
 
 // ─── Validación de entorno ──────────────────────────────────────
 function validateEnv() {

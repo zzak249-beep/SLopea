@@ -6,7 +6,7 @@
  */
 
 const TelegramBot = require('node-telegram-bot-api');
-const logger = require('./logger');
+const logger = require('../utils/logger');
 
 let bot = null;
 const chatId = process.env.TELEGRAM_CHAT_ID;

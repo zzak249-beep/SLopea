@@ -6,9 +6,9 @@
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
-const bingx    = require('../exchange/bingx');
-const telegram = require('../telegram/bot');
-const logger   = require('../utils/logger');
+const bingx    = require('./bingx');
+const telegram = require('./bot');
+const logger   = require('./logger');
 
 class TradeController {
   constructor() {

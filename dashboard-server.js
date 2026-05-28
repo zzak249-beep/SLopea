@@ -13,8 +13,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Importar módulos del bot (si están disponibles)
 let controller, scanner;
 try {
-  controller = require('./tradeController');
-  scanner    = require('./scanner');
+  controller = require('../signals/tradeController');
+  scanner    = require('../signals/scanner');
 } catch {}
 
 // ─── API Endpoints ─────────────────────────────────────────────

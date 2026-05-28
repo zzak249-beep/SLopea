@@ -5,10 +5,10 @@
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
-const bingx    = require('../exchange/bingx');
-const { apexFusion } = require('../engine/apexFusion');
-const telegram = require('../telegram/bot');
-const logger   = require('../utils/logger');
+const bingx    = require('./bingx');
+const { apexFusion } = require('./apexFusion');
+const telegram = require('./bot');
+const logger   = require('./logger');
 
 const TF_PRIMARY = process.env.TIMEFRAME_PRIMARY || '3m';
 const TF_HTF     = process.env.TIMEFRAME_HTF     || '15m';

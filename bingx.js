@@ -7,7 +7,7 @@
 
 const axios  = require('axios');
 const crypto = require('crypto');
-const logger = require('../utils/logger');
+const logger = require('./logger');
 
 const BASE_URL = process.env.BINGX_BASE_URL || 'https://open-api.bingx.com';
 
