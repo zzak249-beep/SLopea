@@ -1,168 +1,224 @@
-# QF Machine × JP Fusion Bot v3 🤖
+# 🔱 APEX FUSION BOT v1.0
 
-Bot de trading algorítmico para criptomonedas. Porta la lógica del indicador Pine Script (12 capas) a Python para operar en BingX con señales en Telegram.
-
-> ⚠️ **PAPER MODE activo por defecto.** El bot NO opera con dinero real hasta que cambies `PAPER_MODE=false` explícitamente.
-
----
-
-## 🏗 Arquitectura
-
-```
-src/
-├── main.py          ← Orquestador principal (loop de trading)
-├── signals.py       ← Motor de señales (12 capas, port del Pine Script)
-├── exchange.py      ← Conector BingX REST API
-├── risk.py          ← Gestión de riesgo y circuit breakers
-├── positions.py     ← Tracker de posiciones abiertas
-├── telegram_bot.py  ← Bot de Telegram (señales + comandos)
-├── config.py        ← Todos los parámetros configurables
-└── backtest.py      ← Backtester sobre datos históricos CSV
-```
+> **Sniper Predator VSA V8 × QF Machine × JP Fusion v3.1**  
+> Bot de trading automático para BingX Perpetual Futures con señales por Telegram
 
 ---
 
-## ⚡ Setup rápido (Railway)
+## ⚡ Características
 
-### 1. Fork / sube a GitHub
+### Motores de análisis fusionados
+- **Sniper Engine** — Liquidez, pivotes, VWAP, Magic Slope, STC, ADX, RVOL, POC
+- **VSA Engine** — Regresión lineal volumen/spread + correlación Pearson, patrones institucionales
+- **QF Machine Engine** — Factores cuantitativos (momentum, mean-reversion, OBV), Decay adaptativo, FVG, Order Blocks, CVD Delta, Squeeze Momentum, Dark Pool proxy
 
+### Ventaja especial: **APEX PRIME** 🔱
+Señal ultra-rara cuando los **3 motores confluyen simultáneamente** en la misma dirección + tendencia macro alineada. Probabilidad muy alta.
+
+### Niveles de señal
+| Nivel | Score | Descripción |
+|-------|-------|-------------|
+| 🔱 PRIME | Todos confluyen | Triple confluencia — máxima prioridad |
+| ⭐ SUPREMA | ≥85 | Score máximo + Dark Pool o CVD divergencia |
+| 🔥 FUEL | ≥72 | Score alto + catalizador (TL break / Squeeze / FVG+OB) |
+| 📶 STD | ≥62 | Entrada estándar |
+
+### Mejoras implementadas sobre los scripts originales
+- ✅ **Decay adaptativo** (resuelve bloqueo crónico en 3min)
+- ✅ **CVD ventana rodante** (elimina deriva acumulativa)
+- ✅ **Multi-timeframe 3 niveles** (3m + 15m + 1h)
+- ✅ **Sistema de scoring 0-100** fusión de ambos motores
+- ✅ **Anti-reentrada** por símbolo y dirección
+- ✅ **Trailing stop** automático a 1.5R → mueve SL a BE
+- ✅ **Filter de sesión y volumen** (mínimo $500k 24h)
+- ✅ **SL estructural** basado en pivot real
+
+---
+
+## 🚀 Setup rápido
+
+### 1. Clonar y dependencias
 ```bash
-git init
-git add .
-git commit -m "QF Bot v3 initial"
-git remote add origin https://github.com/TU_USUARIO/qf-bot.git
-git push -u origin main
+git clone https://github.com/tu-usuario/apex-fusion-bot
+cd apex-fusion-bot
+npm install
 ```
 
-### 2. Crea proyecto en Railway
-
-1. railway.app → New Project → Deploy from GitHub
-2. Selecciona tu repo
-3. Railway detecta el `Dockerfile` automáticamente
-
-### 3. Variables de entorno en Railway
-
-En tu proyecto → **Variables** → añade:
-
-| Variable | Valor |
-|---|---|
-| `BINGX_API_KEY` | Tu API key de BingX |
-| `BINGX_SECRET` | Tu secret de BingX |
-| `TELEGRAM_TOKEN` | Token de @BotFather |
-| `TELEGRAM_CHAT_ID` | Tu Chat ID (ver abajo) |
-| `PAPER_MODE` | `true` (¡no cambies hasta validar!) |
-| `MIN_CONVICTION` | `6` |
-| `LOOP_SECONDS` | `30` |
-| `TRAIL_ATR` | `1.5` |
-
-### 4. Obtener API Keys de BingX
-
-1. BingX → Cuenta → Gestión de API
-2. Crear API → habilitar **Futuros Perpetuos**
-3. Habilitar: Lectura ✅ | Trading ✅ | Retiro ❌ (NUNCA)
-4. IP whitelist: añade la IP de tu servidor Railway (opcional pero recomendado)
-
-### 5. Obtener Telegram Token y Chat ID
-
+### 2. Configurar variables de entorno
 ```bash
-# 1. Habla con @BotFather → /newbot → sigue instrucciones → guarda el token
+cp .env.example .env
+nano .env
+```
 
-# 2. Obtén tu Chat ID:
-curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
-# Manda un mensaje a tu bot y busca "chat":{"id": XXXX}
+Rellenar:
+- `BINGX_API_KEY` y `BINGX_SECRET_KEY` → en BingX → API Management
+- `TELEGRAM_BOT_TOKEN` → crear bot con [@BotFather](https://t.me/BotFather)
+- `TELEGRAM_CHAT_ID` → obtener con [@userinfobot](https://t.me/userinfobot)
+
+### 3. Configurar BingX API
+
+En BingX → Gestión de API:
+1. Crear nueva API Key
+2. Activar permisos: **Trading de Futuros** (no retirada)
+3. Whitelist IP del servidor Railway
+
+### 4. Probar en Paper Mode
+```bash
+MODE=paper node src/index.js
+```
+
+### 5. Activar trading real
+```env
+MODE=live
+RISK_PER_TRADE=1
+LEVERAGE=10
+MAX_OPEN_TRADES=3
 ```
 
 ---
 
-## 🧪 Backtest antes de operar
+## ☁️ Deploy en Railway
 
-```bash
-# Instalar dependencias
-pip install -r requirements.txt
+### Método rápido
+1. Fork este repositorio en GitHub
+2. En [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Seleccionar el repo
+4. En **Variables** añadir todas las variables del `.env.example`
+5. Deploy automático ✅
 
-# Descargar datos históricos de BingX (CSV)
-# o exportar desde TradingView: Símbolo → Exportar datos CSV
-
-# Ejecutar backtest
-python src/backtest.py \
-  --file3m  datos/BTCUSDT_3m.csv \
-  --conviction 6 \
-  --out logs/bt_result.json
-
-# Resultado:
-# ══════════════════════════════════════════
-#   total_trades     : 87
-#   win_rate_pct     : 58.6
-#   total_pnl        : +234.50
-#   max_drawdown_pct : 8.2
-#   profit_factor    : 1.74
-# ══════════════════════════════════════════
+### Variables obligatorias en Railway
 ```
-
-**Criterios mínimos para pasar a paper trading:**
-- Win rate > 50%
-- Profit factor > 1.3
-- Max drawdown < 15%
-
-**Criterios mínimos para pasar a live:**
-- Paper trading rentable durante ≥ 3 semanas
-- Al menos 30 operaciones en paper
-- Win rate estable > 52%
+BINGX_API_KEY=...
+BINGX_SECRET_KEY=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+MODE=paper
+```
 
 ---
 
 ## 📱 Comandos Telegram
 
 | Comando | Función |
-|---|---|
-| `/start` | Panel principal con botones |
-| `/status` | Equity, PnL, drawdown, circuit breaker |
-| `/pause` | Detiene nuevas entradas (posiciones abiertas siguen) |
-| `/resume` | Reanuda el bot |
-| `/reset` | Desbloquea circuit breaker manualmente |
-| `/mode` | Muestra modo paper vs live |
-| `/help` | Lista de comandos |
+|---------|---------|
+| `/start` | Menú de ayuda |
+| `/status` | Estado del bot |
+| `/positions` | Posiciones abiertas |
+| `/balance` | Balance de cuenta |
+| `/stats` | Estadísticas de rendimiento |
+| `/pause` | Pausar nuevas entradas |
+| `/resume` | Reanudar |
+| `/closeall` | Cerrar todas las posiciones |
+| `/risk 2` | Cambiar riesgo a 2% |
 
 ---
 
-## 🛡 Gestión de Riesgo (config.py)
+## ⚙️ Configuración recomendada
 
-| Parámetro | Default | Descripción |
-|---|---|---|
-| `leverage` | 5x | Apalancamiento (empieza con 3-5x) |
-| `risk_pct_suprema` | 1.5% | Riesgo por op. señal SUPREMA |
-| `risk_pct_fuel` | 1.0% | Riesgo por op. señal FUEL |
-| `risk_pct_std` | 0.5% | Riesgo por op. señal STD |
-| `max_daily_loss_pct` | 3% | Circuit breaker diario |
-| `max_drawdown_pct` | 15% | Circuit breaker permanente |
-| `max_consecutive_losses` | 4 | Pause tras N pérdidas seguidas |
-| `max_daily_trades` | 10 | Máximo trades por día |
+### Conservador (bajo riesgo)
+```env
+RISK_PER_TRADE=1
+LEVERAGE=5
+MAX_OPEN_TRADES=3
+MIN_SCORE_ENTRY=68
+MIN_SCORE_FUEL=78
+LONG_ONLY=true
+```
 
----
+### Balanceado (recomendado)
+```env
+RISK_PER_TRADE=2
+LEVERAGE=10
+MAX_OPEN_TRADES=5
+MIN_SCORE_ENTRY=62
+MIN_SCORE_FUEL=72
+LONG_ONLY=false
+```
 
-## 📊 Señales — Niveles de calidad
-
-| Tier | Condición | Emoji Telegram |
-|---|---|---|
-| **SUPREMA** | FUEL + Dark Pool ó CVD div. | ⭐⭐⭐ |
-| **FUEL** | STD + TL break ó Squeeze ó FVG/OB + CVD | 🔥 |
-| **STD** | 6 capas base alineadas | ▶️ |
-
-Con `MIN_CONVICTION=6` sólo se ejecutan señales con ≥6/10 filtros activos.
-
----
-
-## 🔧 Ajustes recomendados por capital
-
-| Capital | Leverage | Risk/op | Símbolos |
-|---|---|---|---|
-| < $500 | 3x | 0.5% / 0.8% / 1.2% | 1 (BTC) |
-| $500-2K | 5x | 0.5% / 1.0% / 1.5% | 1-2 |
-| $2K-10K | 5-10x | 0.3% / 0.8% / 1.2% | 2-3 |
-| > $10K | Consult. prof. | < 0.5% | 2-4 |
+### Agresivo (alto riesgo)
+```env
+RISK_PER_TRADE=3
+LEVERAGE=20
+MAX_OPEN_TRADES=8
+MIN_SCORE_ENTRY=55
+MIN_SCORE_FUEL=68
+LONG_ONLY=false
+```
 
 ---
 
-## ⚠️ Disclaimer
+## 📊 Arquitectura del Score APEX
 
-Este software es una herramienta de automatización. El trading de futuros de criptomonedas conlleva riesgo de pérdida total del capital. Valida siempre en paper trading antes de usar dinero real. El autor no es responsable de pérdidas.
+```
+APEX SCORE LONG (0-100)
+├── Sniper Engine    → 0-40 pts
+│   ├── EMA trend          +6
+│   ├── Magic Slope        +8  ← diferenciador clave
+│   ├── RVOL               +6
+│   ├── Distancia POC      +5
+│   ├── ADX < 35           +5
+│   ├── STC acelerando     +5
+│   └── HTF alcista        +5
+├── QF Machine       → 0-40 pts
+│   ├── norm_score         30%
+│   ├── CVD Delta          25%
+│   ├── Momentum           20%
+│   ├── Decay adaptativo   15%
+│   └── HTF + Asimetría    10%
+└── VSA Engine       → 0-20 pts (bonus)
+    └── Patrón institucional detectado
+```
+
+---
+
+## ⚠️ Riesgos y advertencias
+
+- **No es un sistema infalible.** Todo bot puede tener pérdidas.
+- Empieza **siempre en paper mode** al menos 1-2 semanas.
+- Nunca arriesgues más del 1-2% por trade en live.
+- El apalancamiento amplifica pérdidas tanto como ganancias.
+- Los mercados de crypto son extremadamente volátiles.
+- Este software se proporciona sin garantías. Úsalo bajo tu propia responsabilidad.
+
+---
+
+## 📁 Estructura del proyecto
+
+```
+apex-fusion-bot/
+├── src/
+│   ├── engine/
+│   │   └── apexFusion.js     # Motor principal fusionado
+│   ├── exchange/
+│   │   └── bingx.js          # Conector BingX API
+│   ├── signals/
+│   │   ├── scanner.js         # Scanner de pares
+│   │   └── tradeController.js # Gestión de trades
+│   ├── telegram/
+│   │   └── bot.js             # Bot Telegram
+│   ├── dashboard/
+│   │   └── server.js          # Dashboard web
+│   ├── utils/
+│   │   └── logger.js
+│   └── index.js               # Entry point
+├── .env.example
+├── railway.json
+├── package.json
+└── README.md
+```
+
+---
+
+## 🔱 La ventaja APEX PRIME
+
+La señal `APEX PRIME` se activa cuando:
+1. **Sniper Engine** detecta barrido de liquidez + confluencia completa
+2. **VSA Engine** confirma patrón institucional (SC, HB, SPR, etc.)  
+3. **QF Machine** tiene score ≥ 35/60 con catalizador activo
+4. **Tendencia 1H** alineada con la dirección
+
+Esta cuádruple confluencia es estadísticamente extremadamente rara y suele marcar puntos de inflexión con alta probabilidad.
+
+---
+
+*APEX FUSION BOT v1.0 — Uso bajo propia responsabilidad*
