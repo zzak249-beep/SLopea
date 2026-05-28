@@ -159,12 +159,21 @@ async function getOpenOrders(symbol) {
 // ─── TRADING ───────────────────────────────────────────────────
 
 async function setLeverage(symbol, leverage) {
-  try {
-    await apiRequest('POST', `/openApi/swap/v2/trade/leverage?symbol=${symbol}&side=LONG&leverage=${leverage}&timestamp=${Date.now()}&signature=`, {}, false);
-  } catch {}
-  try {
-    await apiRequest('POST', `/openApi/swap/v2/trade/leverage?symbol=${symbol}&side=SHORT&leverage=${leverage}&timestamp=${Date.now()}&signature=`, {}, false);
-  } catch {}
+  const secret = process.env.BINGX_SECRET_KEY;
+  const apiKey = process.env.BINGX_API_KEY;
+  for (const side of ['LONG', 'SHORT']) {
+    try {
+      const params = { symbol, side, leverage: leverage.toString(), timestamp: Date.now() };
+      const qs = buildQueryString(params);
+      const sig = sign(qs, secret);
+      await axios({
+        method: 'POST',
+        url: `${BASE_URL}/openApi/swap/v2/trade/leverage?${qs}&signature=${sig}`,
+        headers: { 'X-BX-APIKEY': apiKey, 'Content-Type': 'application/json' },
+        timeout: 10000,
+      });
+    } catch {}
+  }
 }
 
 /**
@@ -184,13 +193,21 @@ async function placeMarketOrder(symbol, side, quantity, reduceOnly = false) {
     type: 'MARKET',
     quantity: quantity.toString(),
     reduceOnly: reduceOnly ? 'true' : 'false',
+    timestamp: Date.now(),
   };
+  const qs = buildQueryString(params);
+  const sig = sign(qs, process.env.BINGX_SECRET_KEY);
 
-  const data = await apiRequest('POST',
-    `/openApi/swap/v2/trade/order?${buildQueryString({ ...params, timestamp: Date.now() })}&signature=${sign(buildQueryString({ ...params, timestamp: Date.now() }), process.env.BINGX_SECRET_KEY)}`,
-    {}, false
-  );
-  return data;
+  const res = await axios({
+    method: 'POST',
+    url: `${BASE_URL}/openApi/swap/v2/trade/order?${qs}&signature=${sig}`,
+    headers: { 'X-BX-APIKEY': process.env.BINGX_API_KEY, 'Content-Type': 'application/json' },
+    timeout: 10000,
+  });
+  if (res.data.code !== 0 && res.data.code !== undefined) {
+    throw new Error(`BingX Order Error ${res.data.code}: ${res.data.msg}`);
+  }
+  return res.data.data || res.data;
 }
 
 /**
@@ -206,12 +223,18 @@ async function placeStopOrder(symbol, side, stopPrice, quantity) {
     stopPrice: stopPrice.toString(),
     quantity: quantity.toString(),
     closePosition: 'true',
+    timestamp: Date.now(),
   };
   try {
-    return await apiRequest('POST',
-      `/openApi/swap/v2/trade/order?${buildQueryString({ ...params, timestamp: Date.now() })}&signature=${sign(buildQueryString({ ...params, timestamp: Date.now() }), process.env.BINGX_SECRET_KEY)}`,
-      {}, false
-    );
+    const qs = buildQueryString(params);
+    const sig = sign(qs, process.env.BINGX_SECRET_KEY);
+    const res = await axios({
+      method: 'POST',
+      url: `${BASE_URL}/openApi/swap/v2/trade/order?${qs}&signature=${sig}`,
+      headers: { 'X-BX-APIKEY': process.env.BINGX_API_KEY, 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    return res.data.data || res.data;
   } catch (e) {
     logger.warn(`SL order failed: ${e.message}`);
     return null;
@@ -231,12 +254,18 @@ async function placeTakeProfitOrder(symbol, side, tpPrice, quantity) {
     stopPrice: tpPrice.toString(),
     quantity: quantity.toString(),
     closePosition: 'true',
+    timestamp: Date.now(),
   };
   try {
-    return await apiRequest('POST',
-      `/openApi/swap/v2/trade/order?${buildQueryString({ ...params, timestamp: Date.now() })}&signature=${sign(buildQueryString({ ...params, timestamp: Date.now() }), process.env.BINGX_SECRET_KEY)}`,
-      {}, false
-    );
+    const qs = buildQueryString(params);
+    const sig = sign(qs, process.env.BINGX_SECRET_KEY);
+    const res = await axios({
+      method: 'POST',
+      url: `${BASE_URL}/openApi/swap/v2/trade/order?${qs}&signature=${sig}`,
+      headers: { 'X-BX-APIKEY': process.env.BINGX_API_KEY, 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    return res.data.data || res.data;
   } catch (e) {
     logger.warn(`TP order failed: ${e.message}`);
     return null;
@@ -249,7 +278,15 @@ async function placeTakeProfitOrder(symbol, side, tpPrice, quantity) {
 async function cancelAllOrders(symbol) {
   if (process.env.MODE === 'paper') return true;
   try {
-    await apiRequest('DELETE', `/openApi/swap/v2/trade/allOpenOrders?symbol=${symbol}&timestamp=${Date.now()}&signature=`, {}, false);
+    const params = { symbol, timestamp: Date.now() };
+    const qs = buildQueryString(params);
+    const sig = sign(qs, process.env.BINGX_SECRET_KEY);
+    await axios({
+      method: 'DELETE',
+      url: `${BASE_URL}/openApi/swap/v2/trade/allOpenOrders?${qs}&signature=${sig}`,
+      headers: { 'X-BX-APIKEY': process.env.BINGX_API_KEY, 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
     return true;
   } catch { return false; }
 }

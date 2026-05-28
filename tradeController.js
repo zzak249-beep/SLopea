@@ -212,8 +212,8 @@ class TradeController {
 
     // Estimar PnL (aproximado — el real lo da el exchange)
     const pnl = trade.peakPnl > 0
-      ? Math.abs(trade.entryPrice - trade.tp || trade.entryPrice) * trade.qty
-      : -Math.abs(trade.entryPrice - trade.sl) * trade.qty;
+      ? Math.abs(trade.entryPrice - (trade.tp || trade.entryPrice)) * trade.qty
+      : -Math.abs(trade.entryPrice - (trade.sl || trade.entryPrice)) * trade.qty;
 
     this.updateStats(pnl);
     this.lastTradeDir.set(symbol, trade.side);
