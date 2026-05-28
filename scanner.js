@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
- * ║  SCANNER — Escanea todos los pares de BingX                 ║
- * ║  Filtra por volumen, aplica APEX FUSION, envía señales      ║
+ * ║  SCANNER — Escanea TODOS los pares de BingX                 ║
+ * ║  Sin límite de pares · Filtra por volumen mínimo            ║
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
@@ -10,11 +10,12 @@ const { apexFusion } = require('./apexFusion');
 const telegram = require('./bot');
 const logger   = require('./logger');
 
-const TF_PRIMARY = process.env.TIMEFRAME_PRIMARY || '3m';
-const TF_HTF     = process.env.TIMEFRAME_HTF     || '15m';
-const TF_TREND   = process.env.TIMEFRAME_TREND   || '1h';
-const MIN_VOL    = parseFloat(process.env.MIN_VOLUME_24H || 500000);
-const EXCLUDED   = (process.env.EXCLUDED_PAIRS || '').split(',').map(s => s.trim()).filter(Boolean);
+const TF_PRIMARY  = process.env.TIMEFRAME_PRIMARY || '3m';
+const TF_HTF      = process.env.TIMEFRAME_HTF     || '15m';
+const TF_TREND    = process.env.TIMEFRAME_TREND   || '1h';
+const MIN_VOL     = parseFloat(process.env.MIN_VOLUME_24H || 50000); // 50k por defecto — más cobertura
+const MAX_SYMBOLS = parseInt(process.env.MAX_SYMBOLS     || 9999);   // sin límite real
+const EXCLUDED    = (process.env.EXCLUDED_PAIRS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Cooldown por símbolo: evita señales repetidas (ms)
 const SIGNAL_COOLDOWN = 30 * 60 * 1000; // 30 min
@@ -24,7 +25,7 @@ const signalCooldowns = new Map();
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /**
- * Filtra pares por volumen y excluidos
+ * Devuelve TODOS los pares USDT activos de BingX sin límite de cantidad
  */
 async function getActiveSymbols() {
   try {
@@ -37,7 +38,7 @@ async function getActiveSymbols() {
         return true;
       })
       .sort((a, b) => b.volume24h - a.volume24h)
-      .slice(0, 80); // máximo 80 pares para no saturar
+      .slice(0, MAX_SYMBOLS);
 
     logger.info(`Scanner: ${filtered.length} pares activos (vol > $${MIN_VOL.toLocaleString()})`);
     return filtered.map(t => t.symbol);
@@ -81,6 +82,8 @@ function isInCooldown(symbol) {
 
 /**
  * Scan completo de todos los pares
+ * BATCH = 8: más rápido sin saturar la API de BingX
+ * sleep = 200ms entre batches (era 300ms)
  */
 async function runScan(tradeController, onSignal) {
   const symbols = await getActiveSymbols();
@@ -91,9 +94,10 @@ async function runScan(tradeController, onSignal) {
 
   const signals = [];
   let analyzed = 0;
+  const BATCH = 8;
 
-  // Procesar en batches de 5 para no saturar la API
-  const BATCH = 5;
+  logger.info(`Scanner: iniciando análisis de ${symbols.length} pares...`);
+
   for (let i = 0; i < symbols.length; i += BATCH) {
     const batch = symbols.slice(i, i + BATCH);
 
@@ -103,11 +107,8 @@ async function runScan(tradeController, onSignal) {
       if (isInCooldown(item.symbol)) continue;
 
       signals.push(item);
-
-      // Registrar cooldown
       signalCooldowns.set(item.symbol, Date.now());
 
-      // Notificar señal
       if (onSignal) onSignal(item.symbol, item.result);
       telegram.sendSignal(item.result, item.symbol);
 
@@ -118,10 +119,16 @@ async function runScan(tradeController, onSignal) {
     }
 
     analyzed += batch.length;
-    await sleep(300); // 300ms entre batches
+
+    // Log de progreso cada 50 pares
+    if (analyzed % 50 === 0) {
+      logger.info(`Scanner: ${analyzed}/${symbols.length} pares analizados...`);
+    }
+
+    await sleep(200); // 200ms entre batches
   }
 
-  logger.info(`Scanner: ${analyzed} pares analizados, ${signals.length} señales encontradas`);
+  logger.info(`Scanner: COMPLETO — ${analyzed} pares analizados, ${signals.length} señales encontradas`);
   return signals;
 }
 
@@ -146,7 +153,6 @@ function startContinuousScan(tradeController, intervalMinutes = 3) {
   // Primera ejecución inmediata
   run();
 
-  // Repetir cada intervalo
   const intervalMs = intervalMinutes * 60 * 1000;
   return setInterval(run, intervalMs);
 }
