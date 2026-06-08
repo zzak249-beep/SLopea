@@ -110,46 +110,49 @@ class BingXClient:
     # ── Mercado ───────────────────────────────────────────────────────────────
 
     async def get_all_symbols(self) -> list[str]:
-        """Devuelve TODOS los pares USDT de perpetuos BingX con volumen mínimo."""
-        data = await self._get("/openApi/swap/v2/quote/contracts")
-        log.debug("get_all_symbols raw keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+        """
+        Devuelve pares USDT de perpetuos BingX que superen MIN_VOLUME_USDT.
+        Usa /ticker (todos) para obtener volumen real en USDT.
+        """
+        # ── Paso 1: obtener tickers con volumen 24h ───────────────────────────
+        ticker_data = await self._get("/openApi/swap/v2/quote/ticker")
+        tickers_raw = ticker_data.get("data", [])
+        if isinstance(tickers_raw, dict):
+            tickers_raw = tickers_raw.get("tickers", tickers_raw.get("list", []))
 
-        # La API devuelve {"code":0, "data": [...]} o a veces la lista directamente
-        raw = data.get("data", [])
-        if isinstance(raw, dict):
-            # Algunos endpoints envuelven en otro nivel
-            raw = raw.get("contracts", raw.get("list", []))
-        if not isinstance(raw, list):
-            log.warning("get_all_symbols: formato inesperado data=%s", str(data)[:200])
-            raw = []
-
-        symbols = []
+        # Construir mapa symbol → volumen USDT 24h
+        # BingX ticker fields: symbol, quoteVolume (USDT), volume (base coin)
         vol_map: dict[str, float] = {}
-
-        for item in raw:
-            sym = item.get("symbol", "")
+        for t in (tickers_raw if isinstance(tickers_raw, list) else []):
+            sym = t.get("symbol", "")
             if not sym.endswith("-USDT"):
                 continue
-            if sym in C.BLACKLIST:
-                continue
-
-            # BingX usa distintos nombres según el endpoint: volume, volume24h, quoteVolume
+            # quoteVolume es en USDT, volume es en moneda base
             vol = float(
-                item.get("volume", 0) or
-                item.get("volume24h", 0) or
-                item.get("quoteVolume", 0) or 0
+                t.get("quoteVolume", 0) or
+                t.get("volume", 0) or 0
             )
             vol_map[sym] = vol
 
+        log.debug("get_all_symbols: %d tickers con volumen USDT", len(vol_map))
+
+        # ── Paso 2: filtrar por volumen y blacklist ───────────────────────────
+        symbols = []
+        for sym, vol in vol_map.items():
+            if sym in C.BLACKLIST:
+                continue
             if C.MIN_VOLUME_USDT > 0 and vol < C.MIN_VOLUME_USDT:
                 continue
             symbols.append(sym)
 
-        log.info("get_all_symbols: %d contratos raw, %d pasan filtro volumen", len(raw), len(symbols))
+        log.info(
+            "get_all_symbols: %d contratos raw, %d pasan filtro volumen (min=%.0f USDT)",
+            len(vol_map), len(symbols), C.MIN_VOLUME_USDT,
+        )
 
-        # Si TOP_N_SYMBOLS > 0 limita lista ordenando por volumen descendente
+        # ── Paso 3: ordenar y limitar ─────────────────────────────────────────
+        symbols.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
         if C.TOP_N_SYMBOLS > 0:
-            symbols.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
             symbols = symbols[: C.TOP_N_SYMBOLS]
 
         return symbols
@@ -209,30 +212,34 @@ class BingXClient:
             signed=True,
         )
         try:
-            payload = data.get("data", {})
+            # Estructura real de BingX:
+            # {"code":0, "msg":"", "data": [{"userId":"...", "asset":"USDT",
+            #   "balance":"254.77", "availableMargin":"0.42", ...}, ...]}
+            payload = data.get("data", data)   # si no hay "data" usa el root
 
-            # Formato 1: data.balance es una lista de dicts por asset
-            balance_field = payload.get("balance", payload)
-            if isinstance(balance_field, list):
-                for a in balance_field:
-                    if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                        return float(a.get("availableMargin", 0))
-
-            # Formato 2: data.balance es un dict único (un solo asset)
-            if isinstance(balance_field, dict):
-                if balance_field.get("asset", "") == "USDT":
-                    return float(balance_field.get("availableMargin", 0))
-                # Puede ser directamente el nivel de data
-                if "availableMargin" in balance_field:
-                    return float(balance_field["availableMargin"])
-
-            # Formato 3: data es lista directamente
+            # Caso 1: data es una lista de assets directamente
             if isinstance(payload, list):
                 for a in payload:
                     if isinstance(a, dict) and a.get("asset", "") == "USDT":
                         return float(a.get("availableMargin", 0))
+                # Si no hay asset USDT explícito, devuelve el primero disponible
+                for a in payload:
+                    if isinstance(a, dict) and "availableMargin" in a:
+                        return float(a["availableMargin"])
 
-            log.warning("get_balance: formato inesperado %s", str(data)[:300])
+            # Caso 2: data es un dict con clave "balance" que es lista
+            if isinstance(payload, dict):
+                bal = payload.get("balance", payload)
+                if isinstance(bal, list):
+                    for a in bal:
+                        if isinstance(a, dict) and a.get("asset", "") == "USDT":
+                            return float(a.get("availableMargin", 0))
+                elif isinstance(bal, dict) and "availableMargin" in bal:
+                    return float(bal["availableMargin"])
+                elif "availableMargin" in payload:
+                    return float(payload["availableMargin"])
+
+            log.warning("get_balance: no se encontró USDT en payload=%s", str(payload)[:300])
             return 0.0
         except Exception as e:
             log.warning("get_balance error: %s | data=%s", e, str(data)[:300])
