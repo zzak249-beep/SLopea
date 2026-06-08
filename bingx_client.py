@@ -22,19 +22,28 @@ log = logging.getLogger("bingx")
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(params: dict) -> str:
-    query = urlencode(sorted(params.items()))
+def _sign(query_string: str) -> str:
+    """HMAC-SHA256 sobre el query string ya construido (sin signature)."""
     return hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
-        query.encode("utf-8"),
+        query_string.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
-def _signed_params(params: dict) -> dict:
-    p = dict(params)   # copia para no mutar el original
+def _build_query(params: dict) -> str:
+    """Construye query string en orden de inserción (sin ordenar)."""
+    return urlencode(params)
+
+def _signed_query(params: dict) -> str:
+    """
+    Devuelve el query string completo incluyendo signature al final.
+    BingX firma los params en orden de inserción y añade &signature=xxx al final.
+    """
+    p = dict(params)
     p["timestamp"] = _ts()
-    p["signature"] = _sign(p)
-    return p
+    qs = _build_query(p)
+    sig = _sign(qs)
+    return f"{qs}&signature={sig}"
 
 # ── Cliente base ─────────────────────────────────────────────────────────────
 
@@ -47,10 +56,7 @@ class BingXClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={
-                    "X-BX-APIKEY": C.BINGX_API_KEY,
-                    "Content-Type": "application/json",
-                },
+                headers={"X-BX-APIKEY": C.BINGX_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=15),
             )
         return self._session
@@ -64,11 +70,15 @@ class BingXClient:
         base_params = params or {}
         for attempt in range(3):
             try:
-                p = _signed_params(base_params) if signed else dict(base_params)
-                async with session.get(f"{self.BASE}{path}", params=p) as r:
+                if signed:
+                    qs = _signed_query(base_params)
+                    url = f"{self.BASE}{path}?{qs}"
+                else:
+                    url = f"{self.BASE}{path}"
+                    if base_params:
+                        url += "?" + _build_query(base_params)
+                async with session.get(url) as r:
                     data = await r.json(content_type=None)
-                    if data.get("code", 0) not in (0, None) and data.get("code", 0) != 0:
-                        log.debug("GET %s → code=%s msg=%s", path, data.get("code"), data.get("msg", ""))
                     return data
             except Exception as e:
                 if attempt == 2:
@@ -81,8 +91,10 @@ class BingXClient:
         session = await self._get_session()
         for attempt in range(3):
             try:
-                p = _signed_params(params)
-                async with session.post(f"{self.BASE}{path}", params=p) as r:
+                qs = _signed_query(params)
+                url = f"{self.BASE}{path}?{qs}"
+                # BingX: params van en query string, body vacío
+                async with session.post(url, data="") as r:
                     data = await r.json(content_type=None)
                     return data
             except Exception as e:
@@ -96,8 +108,9 @@ class BingXClient:
         session = await self._get_session()
         for attempt in range(3):
             try:
-                p = _signed_params(params)
-                async with session.delete(f"{self.BASE}{path}", params=p) as r:
+                qs = _signed_query(params)
+                url = f"{self.BASE}{path}?{qs}"
+                async with session.delete(url) as r:
                     data = await r.json(content_type=None)
                     return data
             except Exception as e:
