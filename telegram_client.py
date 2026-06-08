@@ -119,7 +119,14 @@ async def notify_trade_closed(
     pnl_usdt: float,
 ) -> bool:
     pnl_emoji = "🟢" if pnl_usdt >= 0 else "🔴"
-    rr = (close_price - entry) / abs(entry - close_price) if abs(entry - close_price) > 0 else 0
+    sl_dist = abs(entry - close_price)
+    if sl_dist > 0:
+        if direction == "LONG":
+            rr = (close_price - entry) / sl_dist
+        else:
+            rr = (entry - close_price) / sl_dist
+    else:
+        rr = 0.0
     msg = (
         f"{pnl_emoji} <b>TRADE CERRADO — QF×JP v6.3</b>\n"
         f"{'━' * 22}\n"

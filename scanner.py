@@ -186,10 +186,14 @@ async def scan_loop(
         iteration += 1
 
         # ── Refrescar lista de símbolos cada 10 iteraciones ──────────────────
-        if iteration % 10 == 1:
+        if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
-                symbols = await client.get_all_symbols()
-                log.info("Símbolos activos: %d", len(symbols))
+                new_symbols = await client.get_all_symbols()
+                if new_symbols:
+                    symbols = new_symbols
+                    log.info("Símbolos activos: %d", len(symbols))
+                else:
+                    log.warning("get_all_symbols devolvió lista vacía (iter=%d)", iteration)
             except Exception as e:
                 log.error("get_all_symbols error: %s", e)
                 if not symbols:
