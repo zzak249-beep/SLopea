@@ -347,11 +347,23 @@ class BingXClient:
     # ── Apalancamiento ────────────────────────────────────────────────────────
 
     async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
-        data = await self._post(
-            "/openApi/swap/v2/trade/leverage",
-            {"symbol": symbol, "side": side, "leverage": leverage},
-        )
-        return data.get("code", -1) == 0
+        """
+        BingX leverage endpoint acepta side=LONG/SHORT en Hedge Mode.
+        Se llama dos veces (LONG + SHORT) para asegurar ambos lados.
+        Si falla, se intenta sin campo side (compatibilidad One-way).
+        """
+        ok = True
+        for lev_side in ("LONG", "SHORT"):
+            data = await self._post(
+                "/openApi/swap/v2/trade/leverage",
+                {"symbol": symbol, "side": lev_side, "leverage": str(leverage)},
+            )
+            code = data.get("code", -1)
+            if code != 0:
+                log.warning("[%s] set_leverage side=%s → code=%s msg=%s",
+                            symbol, lev_side, code, data.get("msg", ""))
+                ok = False
+        return ok
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
 
@@ -455,6 +467,25 @@ class BingXClient:
             log.error("[%s] %s", symbol, msg)
             results["entry"] = {"code": -1, "msg": msg}
             return results
+
+        # Validar notional mínimo (BingX requiere >= 5 USDT por orden)
+        # Obtener precio actual para calcular notional
+        try:
+            ticker = await self.get_ticker(symbol)
+            mark_price = float(ticker.get("lastPrice") or ticker.get("markPrice") or 0)
+            if mark_price > 0:
+                notional = quantity * mark_price
+                MIN_NOTIONAL = 5.0  # USDT mínimo por orden en BingX
+                if notional < MIN_NOTIONAL:
+                    msg = (f"notional={notional:.4f} USDT < mínimo {MIN_NOTIONAL} USDT "
+                           f"(qty={quantity} × price={mark_price:.6f})")
+                    log.error("[%s] %s", symbol, msg)
+                    results["entry"] = {"code": -1, "msg": msg}
+                    return results
+                log.info("[%s] notional=%.2f USDT OK (qty=%.4f × price=%.6f)",
+                         symbol, notional, quantity, mark_price)
+        except Exception as e:
+            log.warning("[%s] no se pudo validar notional: %s", symbol, e)
 
         # 1. Leverage
         await self.set_leverage(symbol, C.LEVERAGE, direction)
