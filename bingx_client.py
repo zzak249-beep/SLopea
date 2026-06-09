@@ -3,7 +3,9 @@ QF×JP Bot v6.3 — BingX Client
 Maneja: klines, símbolos, órdenes MARKET, SL/TP, cierre de posiciones,
 consulta de posiciones abiertas y cancelación de órdenes pendientes.
 
-FIX v6.3.1: recvWindow=10000 en _signed_params para evitar Signature mismatch.
+FIX v6.3.2: _build_signed_url garantiza que 'signature' sea el ÚLTIMO
+parámetro en la query string, tal como exige BingX. Se elimina sorted()
+que reordenaba los params y rompía la firma.
 """
 import hmac
 import hashlib
@@ -24,20 +26,24 @@ log = logging.getLogger("bingx")
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(params: dict) -> str:
-    query = urlencode(sorted(params.items()))
-    log.debug("SIGNING: %s", query)
-    return hmac.new(
+
+def _build_signed_url(base: str, path: str, params: dict) -> str:
+    """
+    Construye la URL firmada garantizando que 'signature' sea el último
+    parámetro. BingX rechaza (code 100001) si el orden no es exacto.
+    """
+    params["timestamp"]  = _ts()
+    params["recvWindow"] = "10000"
+    # Firma sobre el query string SIN signature (orden tal cual)
+    query = urlencode(params)
+    sig = hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
         query.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+    # signature va AL FINAL
+    return f"{base}{path}?{query}&signature={sig}"
 
-def _signed_params(params: dict) -> dict:
-    params["timestamp"]  = _ts()
-    params["recvWindow"] = "10000"          # FIX: evita Signature mismatch
-    params["signature"]  = _sign(params)
-    return params
 
 # ── Cliente base ─────────────────────────────────────────────────────────────
 
@@ -64,14 +70,15 @@ class BingXClient:
 
     async def _get(self, path: str, params: dict | None = None, signed: bool = False) -> dict:
         session = await self._get_session()
-        p = params or {}
-        if signed:
-            p = _signed_params(p)
         for attempt in range(3):
             try:
-                async with session.get(f"{self.BASE}{path}", params=p) as r:
-                    data = await r.json()
-                    return data
+                if signed:
+                    url = _build_signed_url(self.BASE, path, dict(params or {}))
+                    async with session.get(url) as r:
+                        return await r.json()
+                else:
+                    async with session.get(f"{self.BASE}{path}", params=params or {}) as r:
+                        return await r.json()
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -80,12 +87,11 @@ class BingXClient:
 
     async def _post(self, path: str, params: dict) -> dict:
         session = await self._get_session()
-        p = _signed_params(params)
         for attempt in range(3):
             try:
-                async with session.post(f"{self.BASE}{path}", params=p) as r:
-                    data = await r.json()
-                    return data
+                url = _build_signed_url(self.BASE, path, dict(params))
+                async with session.post(url) as r:
+                    return await r.json()
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -94,12 +100,11 @@ class BingXClient:
 
     async def _delete(self, path: str, params: dict) -> dict:
         session = await self._get_session()
-        p = _signed_params(params)
         for attempt in range(3):
             try:
-                async with session.delete(f"{self.BASE}{path}", params=p) as r:
-                    data = await r.json()
-                    return data
+                url = _build_signed_url(self.BASE, path, dict(params))
+                async with session.delete(url) as r:
+                    return await r.json()
             except Exception as e:
                 if attempt == 2:
                     raise
