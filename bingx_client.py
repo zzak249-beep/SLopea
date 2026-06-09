@@ -58,6 +58,8 @@ class BingXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         # Cache de stepSize: {symbol: (qty_step, price_step)}
         self._precision_cache: dict[str, tuple[float, float]] = {}
+        # Cache de leverage configurado: {"SYMBOL:leverage"} — evita rate-limit 100410
+        self._leverage_cache: set[str] = set()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -349,9 +351,13 @@ class BingXClient:
     async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
         """
         BingX leverage endpoint acepta side=LONG/SHORT en Hedge Mode.
-        Se llama dos veces (LONG + SHORT) para asegurar ambos lados.
-        Si falla, se intenta sin campo side (compatibilidad One-way).
+        Cache en memoria: sólo llama la API una vez por símbolo por sesión.
+        Esto evita el rate-limit 100410 que se dispara al llamarlo por cada señal.
         """
+        cache_key = f"{symbol}:{leverage}"
+        if cache_key in self._leverage_cache:
+            return True
+
         ok = True
         for lev_side in ("LONG", "SHORT"):
             data = await self._post(
@@ -359,10 +365,14 @@ class BingXClient:
                 {"symbol": symbol, "side": lev_side, "leverage": str(leverage)},
             )
             code = data.get("code", -1)
-            if code != 0:
+            if code not in (0, 100410):   # 100410 = ya configurado / rate-limit temporal
                 log.warning("[%s] set_leverage side=%s → code=%s msg=%s",
-                            symbol, lev_side, code, data.get("msg", ""))
+                            symbol, lev_side, code, data.get("msg", "")[:200])
                 ok = False
+            await asyncio.sleep(0.2)     # pequeña pausa entre LONG y SHORT
+
+        if ok:
+            self._leverage_cache.add(cache_key)
         return ok
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
