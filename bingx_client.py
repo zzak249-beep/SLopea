@@ -125,6 +125,7 @@ class BingXClient:
 
         symbols = []
         vol_map = {}
+        vol_detected = 0  # DEBUG: cuántos símbolos tienen volumen detectado
 
         for item in raw:
             if not isinstance(item, dict):
@@ -144,23 +145,48 @@ class BingXClient:
             base = sym.replace("-USDT", "")
             if any(base.startswith(p) for p in ("BEAR", "BULL", "PUMP", "NCS")):
                 continue
-            # Volumen 24h — distintos campos según endpoint
-            vol = float(
+
+            # ── FIX: campo de volumen ampliado ────────────────────────────────
+            # BingX cambió nombres de campos entre versiones de la API.
+            # Se prueba todos los nombres conocidos.
+            vol_raw = (
                 item.get("volume24h") or item.get("vol24h") or
-                item.get("quoteVolume") or item.get("turnover24h") or 0
+                item.get("quoteVolume") or item.get("turnover24h") or
+                item.get("tradeAmt") or item.get("quoteVol") or
+                item.get("volValue") or item.get("amount") or
+                item.get("lastTradedVolume") or item.get("vol") or
+                item.get("quantity24h") or 0
             )
+            vol = float(vol_raw) if vol_raw else 0.0
+            if vol > 0:
+                vol_detected += 1
             vol_map[sym] = vol
-            if C.MIN_VOLUME_USDT > 0 and vol < C.MIN_VOLUME_USDT:
+
+            # ── FIX CRÍTICO: solo filtrar cuando el volumen ES CONOCIDO ───────
+            # Si vol=0 significa que no detectamos el campo → incluir símbolo
+            # Si vol>0 y está bajo el mínimo → excluir
+            if C.MIN_VOLUME_USDT > 0 and vol > 0 and vol < C.MIN_VOLUME_USDT:
                 continue
+
             symbols.append(sym)
 
-        # Ordenar por volumen descendente
+        # Ordenar por volumen descendente (los sin volumen van al final)
         symbols.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
 
         if C.TOP_N_SYMBOLS > 0:
             symbols = symbols[: C.TOP_N_SYMBOLS]
 
-        log.info("get_all_symbols: %d símbolos válidos (raw=%d)", len(symbols), len(raw))
+        log.info(
+            "get_all_symbols: %d símbolos válidos (raw=%d, con_vol=%d)",
+            len(symbols), len(raw), vol_detected,
+        )
+        # Si vol_detected=0 significa que el campo de volumen no se detectó —
+        # el bot sigue funcionando pero el filtro MIN_VOLUME_USDT no aplica.
+        if vol_detected == 0 and len(raw) > 0:
+            log.warning(
+                "⚠️  Volumen no detectado en ningún símbolo — "
+                "MIN_VOLUME_USDT ignorado. Revisar campos del endpoint."
+            )
         return symbols
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[list]:
@@ -199,12 +225,7 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        """Retorna balance disponible en USDT.
-        BingX puede devolver data como:
-          - lista directa: [{'asset':'USDT','availableMargin':'0.42',...}, ...]
-          - dict con key balance: {'balance': [...]}
-          - dict plano: {'asset':'USDT','availableMargin':'0.42'}
-        """
+        """Retorna balance disponible en USDT."""
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
@@ -212,29 +233,24 @@ class BingXClient:
         )
         raw = data.get("data", {})
 
-        # Caso 1: data es lista directa  → [{'asset':'USDT', ...}, ...]
         if isinstance(raw, list):
             for a in raw:
                 if a.get("asset", "") == "USDT":
                     return float(a.get("availableMargin", 0) or 0)
-            # Si no hay USDT busca el primero con availableMargin
             for a in raw:
                 v = a.get("availableMargin")
                 if v is not None:
                     return float(v or 0)
             return 0.0
 
-        # Caso 2: data es dict con key 'balance' que es lista
         if isinstance(raw, dict):
             bal = raw.get("balance", raw)
             if isinstance(bal, list):
                 for a in bal:
                     if a.get("asset", "") == "USDT":
                         return float(a.get("availableMargin", 0) or 0)
-            # Caso 3: dict plano {'asset':'USDT','availableMargin':'0.42'}
             if isinstance(bal, dict):
                 return float(bal.get("availableMargin", 0) or 0)
-            # Caso 4: valor numérico directo
             try:
                 return float(bal)
             except Exception:
@@ -246,7 +262,6 @@ class BingXClient:
     # ── Posiciones abiertas ────────────────────────────────────────────────────
 
     async def get_open_positions(self) -> list[dict]:
-        """Lista de posiciones abiertas en BingX Perpetual."""
         data = await self._get(
             "/openApi/swap/v2/user/positions",
             {},
@@ -258,7 +273,6 @@ class BingXClient:
         return [p for p in positions if float(p.get("positionAmt", 0)) != 0]
 
     async def get_open_orders(self, symbol: str) -> list[dict]:
-        """Órdenes pendientes (SL/TP stop-market) para un símbolo."""
         data = await self._get(
             "/openApi/swap/v2/trade/openOrders",
             {"symbol": symbol},
@@ -280,11 +294,10 @@ class BingXClient:
     async def place_market_order(
         self,
         symbol: str,
-        side: str,        # BUY | SELL
+        side: str,
         quantity: float,
-        position_side: str = "LONG",  # LONG | SHORT
+        position_side: str = "LONG",
     ) -> dict:
-        """Abre posición con orden MARKET."""
         params = {
             "symbol": symbol,
             "side": side,
@@ -303,9 +316,8 @@ class BingXClient:
         stop_price: float,
         position_side: str = "LONG",
         close_position: bool = True,
-        order_type: str = "STOP_MARKET",  # STOP_MARKET | TAKE_PROFIT_MARKET
+        order_type: str = "STOP_MARKET",
     ) -> dict:
-        """Coloca SL o TP tipo stop-market."""
         params = {
             "symbol": symbol,
             "side": side,
@@ -338,9 +350,8 @@ class BingXClient:
         self,
         symbol: str,
         quantity: float,
-        position_side: str,  # LONG | SHORT
+        position_side: str,
     ) -> dict:
-        """Cierra posición completamente con orden MARKET."""
         side = "SELL" if position_side == "LONG" else "BUY"
         params = {
             "symbol": symbol,
@@ -357,21 +368,12 @@ class BingXClient:
     async def open_trade(
         self,
         symbol: str,
-        direction: str,      # LONG | SHORT
+        direction: str,
         quantity: float,
         sl_price: float,
         tp1_price: float,
         tp2_price: float,
     ) -> dict:
-        """
-        Secuencia completa:
-        1. Set leverage
-        2. Orden MARKET de entrada
-        3. SL stop-market (cierra todo)
-        4. TP1 stop-market (50% qty)
-        5. TP2 stop-market (50% qty)
-        Retorna dict con resultados de cada paso.
-        """
         side_entry = "BUY" if direction == "LONG" else "SELL"
         side_close = "SELL" if direction == "LONG" else "BUY"
 
@@ -390,10 +392,9 @@ class BingXClient:
         await asyncio.sleep(0.5)
 
         # 3. SL (cierra toda la posición)
-        sl_type = "STOP_MARKET"
         sl_resp = await self.place_stop_market_order(
             symbol, side_close, quantity, sl_price, direction,
-            close_position=True, order_type=sl_type,
+            close_position=True, order_type="STOP_MARKET",
         )
         results["sl"] = sl_resp
 
