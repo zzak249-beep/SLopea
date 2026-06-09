@@ -96,8 +96,13 @@ class BingXClient:
         for attempt in range(3):
             try:
                 url = _build_signed_url(self.BASE, path, dict(params))
+                log.debug("POST %s", url[:200])
                 async with session.post(url) as r:
-                    return await r.json()
+                    data = await r.json()
+                    if isinstance(data, dict) and data.get("code", 0) != 0:
+                        log.error("POST %s → code=%s msg=%s",
+                                  path, data.get("code"), data.get("msg", "")[:300])
+                    return data
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -364,6 +369,7 @@ class BingXClient:
             "type": "MARKET",
             "quantity": str(quantity),
         }
+        log.info("[%s] MARKET order params: %s", symbol, params)
         data = await self._post("/openApi/swap/v2/trade/order", params)
         return data
 
@@ -440,13 +446,15 @@ class BingXClient:
 
         # 0. Obtener stepSize del símbolo y redondear quantity
         qty_step, price_step = await self.get_symbol_precision(symbol)
+        qty_before = quantity
         quantity = self._round_qty(quantity, qty_step)
+        log.info("[%s] qty_raw=%.8f → qty_step=%.8f → qty_final=%.8f",
+                 symbol, qty_before, qty_step, quantity)
         if quantity <= 0:
             msg = f"qty={quantity} inválida tras redondear a stepSize={qty_step}"
             log.error("[%s] %s", symbol, msg)
             results["entry"] = {"code": -1, "msg": msg}
             return results
-        log.debug("[%s] qty ajustada=%.8f (step=%.8f)", symbol, quantity, qty_step)
 
         # 1. Leverage
         await self.set_leverage(symbol, C.LEVERAGE, direction)
