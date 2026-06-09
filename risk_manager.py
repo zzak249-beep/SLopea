@@ -1,6 +1,10 @@
 """
 QF×JP Bot v6.3 — Risk Manager
 Kelly Criterion, daily limits, position sizing, daily drawdown.
+
+FIX v6.3.1: kelly_position_size usa RISK_PCT como base directa.
+  Antes: balance × kelly_f × (RISK_PCT/100) → ~0.1 USDT de riesgo (demasiado pequeño)
+  Ahora: balance × (RISK_PCT/100) escalado por Kelly → tamaño proporcional al capital
 """
 import logging
 from datetime import date, datetime
@@ -40,8 +44,17 @@ class RiskManager:
         tier: str,
     ) -> float:
         """
-        Calcula la cantidad a operar (en moneda base) usando Kelly fraccional.
-        Retorna 0.0 si el riesgo es inválido o los límites están alcanzados.
+        Calcula la cantidad a operar (en moneda base).
+
+        Fórmula:
+          risk_usdt = balance × (RISK_PCT/100)          ← base directa
+          kelly_scale = escala 0.4–1.0 según calidad    ← ajuste por señal
+          qty = (risk_usdt × kelly_scale × LEVERAGE) / |entry - sl|
+
+        Ejemplo con balance=230, RISK_PCT=5, LEVERAGE=5:
+          risk_usdt base = 11.5 USDT
+          kelly_scale ~0.6–1.0 = riesgo real 6.9–11.5 USDT
+          notional = 34–57 USDT por trade
         """
         self._check_reset()
 
@@ -53,8 +66,8 @@ class RiskManager:
             log.warning("SL demasiado cercano a entry para %s", entry)
             return 0.0
 
-        # Ajuste de win_rate y RR por tier
-        tier_mult = {"STD": 1.0, "FUEL": 1.1, "SUP": 1.25}.get(tier, 1.0)
+        # ── Kelly como escalador (0.4 – 1.0) ─────────────────────────────────
+        tier_mult  = {"STD": 1.0, "FUEL": 1.1, "SUP": 1.25}.get(tier, 1.0)
         score_mult = 0.7 + 0.3 * (score / 100.0)
 
         p = min(C.KELLY_WIN_RATE * tier_mult * score_mult, 0.9)
@@ -63,14 +76,25 @@ class RiskManager:
 
         kelly_f = (p * rr - q) / rr
         kelly_f = max(0.0, kelly_f)
-        kelly_f *= C.KELLY_FRACTION  # fracción de Kelly
+        kelly_f *= C.KELLY_FRACTION  # fracción de Kelly (default 0.25)
 
-        # Capital arriesgado en USDT
-        risk_usdt = balance * kelly_f * (C.RISK_PCT / 100.0)
-        risk_usdt = min(risk_usdt, balance * 0.03)  # máx 3% del capital por trade
+        # Normalizar kelly_f en rango 0.4–1.0
+        # kelly_f típico: 0.01–0.12 → mapeamos [0, 0.12] → [0.4, 1.0]
+        kelly_scale = 0.4 + 0.6 * min(1.0, kelly_f / 0.10)
 
-        # Qty en moneda base (con apalancamiento)
+        # ── Capital arriesgado por trade ──────────────────────────────────────
+        risk_usdt = balance * (C.RISK_PCT / 100.0) * kelly_scale
+        # Cap: máximo 8% del capital por trade (antes era 3%)
+        risk_usdt = min(risk_usdt, balance * 0.08)
+
+        # ── Qty en moneda base (con apalancamiento) ────────────────────────────
         qty = (risk_usdt * C.LEVERAGE) / risk_per_unit
+
+        log.debug(
+            "[sizing] balance=%.2f risk_pct=%.1f%% kelly_scale=%.2f "
+            "risk_usdt=%.2f leverage=%dx qty=%.6f",
+            balance, C.RISK_PCT, kelly_scale, risk_usdt, C.LEVERAGE, qty,
+        )
         return round(qty, 6)
 
     # ── Límites diarios ───────────────────────────────────────────────────────
