@@ -8,9 +8,10 @@ Loop principal:
   5. Abre trades en LIVE o notifica en SIGNAL
   6. Corre junto al position_manager loop
 
-FIX v6.3.2:
-  - Balance se obtiene UNA vez por iteración (no por símbolo)
-  - Si get_balance()=0, fallback a C.CAPITAL para no bloquear trades
+FIX v6.3.2: Balance se obtiene UNA vez por iteración
+FIX v6.3.4: Notional check en scanner antes de open_trade.
+  Consulta ticker para obtener mark_price real y calcular
+  notional = qty × price. Aborta si < 5 USDT o > 500 USDT.
 """
 import asyncio
 import logging
@@ -25,6 +26,10 @@ from position_manager import PositionManager, OpenTrade
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
+
+# Notional limits para filtrar pares micro-cap y órdenes gigantes
+MIN_NOTIONAL_USDT = 5.0
+MAX_NOTIONAL_USDT = 500.0
 
 # Símbolos actualmente en blacklist temporal (circuit breaker)
 _cb_blacklist: dict[str, float] = {}   # symbol → timestamp de bloqueo
@@ -55,7 +60,7 @@ async def _process_symbol(
     client: BingXClient,
     risk: RiskManager,
     pos_mgr: PositionManager,
-    balance: float,                     # ← recibido del loop, no se busca aquí
+    balance: float,
 ) -> Optional[Signal]:
     """Analiza un símbolo y ejecuta la acción correspondiente."""
     if pos_mgr.is_trading(symbol):
@@ -103,11 +108,39 @@ async def _process_symbol(
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
 
-    qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
+    # ── Obtener mark_price real para validación de notional ──────────────────
+    mark_price = sig.entry  # fallback: usar entry de la señal
+    try:
+        ticker = await client.get_ticker(symbol)
+        mp = float(ticker.get("lastPrice") or ticker.get("markPrice") or 0)
+        if mp > 0:
+            mark_price = mp
+    except Exception as e:
+        log.debug("[%s] get_ticker error: %s — usando entry como precio", symbol, e)
+
+    # ── Kelly sizing con mark_price real ─────────────────────────────────────
+    qty = risk.kelly_position_size(
+        balance, sig.entry, sig.sl, sig.score, sig.tier,
+        mark_price=mark_price,
+    )
     if qty <= 0:
-        log.warning("[%s] qty=0 (balance=%.2f entry=%.6f sl=%.6f), skip",
-                    symbol, balance, sig.entry, sig.sl)
+        log.warning("[%s] qty=0 (balance=%.2f entry=%.6f sl=%.6f price=%.6f), skip",
+                    symbol, balance, sig.entry, sig.sl, mark_price)
         return None
+
+    # ── Validación de notional en scanner (red de seguridad extra) ────────────
+    notional = qty * mark_price
+    if notional < MIN_NOTIONAL_USDT:
+        log.warning("[%s] notional=%.4f USDT < min=%.1f → skip (par micro-cap)",
+                    symbol, notional, MIN_NOTIONAL_USDT)
+        return None
+    if notional > MAX_NOTIONAL_USDT:
+        log.warning("[%s] notional=%.2f USDT > max=%.0f → skip (posición excesiva)",
+                    symbol, notional, MAX_NOTIONAL_USDT)
+        return None
+
+    log.info("[%s] qty=%.6f notional=%.2f USDT (price=%.6f)",
+             symbol, qty, notional, mark_price)
 
     await tg.notify_signal(sig)
 
@@ -154,10 +187,6 @@ async def _process_symbol(
 
 
 async def _get_balance_safe(client: BingXClient) -> float:
-    """
-    Obtiene balance con fallback a C.CAPITAL si la API devuelve 0.
-    Evita que un fallo de get_balance bloquee todos los trades.
-    """
     try:
         balance = await client.get_balance()
     except Exception as e:
@@ -166,8 +195,7 @@ async def _get_balance_safe(client: BingXClient) -> float:
 
     if balance <= 0:
         log.warning(
-            "get_balance=0 (API devolvió 0 o no parseado) — "
-            "usando CAPITAL fallback=%.2f USDT", C.CAPITAL
+            "get_balance=0 — usando CAPITAL fallback=%.2f USDT", C.CAPITAL
         )
         return C.CAPITAL
 
@@ -191,7 +219,6 @@ async def scan_loop(
         start = time.time()
         iteration += 1
 
-        # ── Refrescar lista de símbolos cada 10 iteraciones ──────────────────
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
                 new_symbols = await client.get_all_symbols()
@@ -210,18 +237,15 @@ async def scan_loop(
             await asyncio.sleep(10)
             continue
 
-        # ── Balance UNA vez por iteración ─────────────────────────────────────
         balance = await _get_balance_safe(client)
         log.info("Balance activo: %.4f USDT", balance)
 
-        # ── Status periódico (cada 20 iteraciones) ────────────────────────────
         if iteration % 20 == 0:
             try:
                 await tg.notify_status(risk.status(), balance, len(symbols))
             except Exception as e:
                 log.warning("status notify error: %s", e)
 
-        # ── Procesar símbolos en batches ──────────────────────────────────────
         BATCH_SIZE = 10
         signals_found = 0
 
