@@ -158,7 +158,12 @@ class BingXClient:
             if sym in C.BLACKLIST:
                 continue
             base = sym.replace("-USDT", "")
-            if any(base.startswith(p) for p in ("BEAR", "BULL", "PUMP", "NCS")):
+            # Filtrar tokens sintéticos, apalancados e índices forex (no operables via API)
+            if any(base.startswith(p) for p in (
+                "BEAR", "BULL", "PUMP", "NCS",
+                "NCFX",          # índices forex sintéticos NCFX (GBP/SGD, EUR/USD, etc.)
+                "DOWN", "UP",    # tokens apalancados tipo DOWN/UP
+            )):
                 continue
 
             vol_raw = (
