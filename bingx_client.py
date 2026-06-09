@@ -6,9 +6,13 @@ consulta de posiciones abiertas y cancelación de órdenes pendientes.
 FIX v6.3.2: _build_signed_url garantiza que 'signature' sea el ÚLTIMO
 parámetro en la query string, tal como exige BingX. Se elimina sorted()
 que reordenaba los params y rompía la firma.
+
+FIX v6.3.3: stepSize cache — redondea quantity al stepSize del símbolo
+antes de enviar órdenes. Evita error 109400 "Invalid parameters".
 """
 import hmac
 import hashlib
+import math
 import time
 import asyncio
 import logging
@@ -52,6 +56,8 @@ class BingXClient:
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        # Cache de stepSize: {symbol: (qty_step, price_step)}
+        self._precision_cache: dict[str, tuple[float, float]] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -212,6 +218,70 @@ class BingXClient:
         )
         return data.get("data", {})
 
+    # ── Precisión de símbolo (stepSize) ─────────────────────────────────────────
+
+    async def get_symbol_precision(self, symbol: str) -> tuple[float, float]:
+        """
+        Retorna (qty_step, price_step) para el símbolo.
+        Usa caché en memoria para no llamar la API en cada orden.
+        qty_step  → mínimo incremento de cantidad (ej: 1.0, 0.1, 0.001)
+        price_step → mínimo incremento de precio (ej: 0.001, 0.01)
+        """
+        if symbol in self._precision_cache:
+            return self._precision_cache[symbol]
+
+        try:
+            data = await self._get("/openApi/swap/v2/quote/contracts")
+            raw = data.get("data", [])
+            if isinstance(raw, dict):
+                raw = raw.get("contracts", raw.get("list", []))
+            if not isinstance(raw, list):
+                raw = []
+
+            for item in raw:
+                sym = item.get("symbol", "")
+                if "-" not in sym and sym.endswith("USDT"):
+                    sym = sym[:-4] + "-USDT"
+                if sym != symbol:
+                    continue
+
+                # Intentar varios campos de stepSize de cantidad
+                qty_step = float(
+                    item.get("tradeMinQuantity") or
+                    item.get("stepSize") or
+                    item.get("quantityStep") or
+                    item.get("lotSize") or
+                    item.get("minQty") or 1
+                )
+                # Intentar varios campos de stepSize de precio
+                price_step = float(
+                    item.get("pricePrecision") or
+                    item.get("tickSize") or
+                    item.get("priceStep") or 0.0001
+                )
+                # pricePrecision puede venir como entero (número de decimales)
+                if price_step >= 1:
+                    price_step = 10 ** (-int(price_step))
+
+                self._precision_cache[symbol] = (qty_step, price_step)
+                log.debug("[%s] stepSize qty=%.8f price=%.8f", symbol, qty_step, price_step)
+                return (qty_step, price_step)
+        except Exception as e:
+            log.warning("get_symbol_precision(%s) error: %s — usando defaults", symbol, e)
+
+        # Fallback seguro
+        defaults = (1.0, 0.0001)
+        self._precision_cache[symbol] = defaults
+        return defaults
+
+    def _round_qty(self, qty: float, step: float) -> float:
+        """Redondea qty hacia abajo al múltiplo más cercano de step."""
+        if step <= 0:
+            return qty
+        precision = max(0, -int(math.floor(math.log10(step))))
+        rounded = math.floor(qty / step) * step
+        return round(rounded, precision)
+
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
@@ -368,6 +438,16 @@ class BingXClient:
 
         results = {}
 
+        # 0. Obtener stepSize del símbolo y redondear quantity
+        qty_step, price_step = await self.get_symbol_precision(symbol)
+        quantity = self._round_qty(quantity, qty_step)
+        if quantity <= 0:
+            msg = f"qty={quantity} inválida tras redondear a stepSize={qty_step}"
+            log.error("[%s] %s", symbol, msg)
+            results["entry"] = {"code": -1, "msg": msg}
+            return results
+        log.debug("[%s] qty ajustada=%.8f (step=%.8f)", symbol, quantity, qty_step)
+
         # 1. Leverage
         await self.set_leverage(symbol, C.LEVERAGE, direction)
 
@@ -387,15 +467,17 @@ class BingXClient:
         )
         results["sl"] = sl_resp
 
-        # 4. TP1 (50% de la qty)
-        qty_half = round(quantity / 2, 8)
+        # 4. TP1 (50% de la qty, redondeado al step)
+        qty_half = self._round_qty(quantity / 2, qty_step)
+        if qty_half <= 0:
+            qty_half = quantity   # fallback: usar toda la qty
         tp1_resp = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
             close_position=False, order_type="TAKE_PROFIT_MARKET",
         )
         results["tp1"] = tp1_resp
 
-        # 5. TP2 (50% de la qty)
+        # 5. TP2 (50% de la qty, redondeado al step)
         tp2_resp = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp2_price, direction,
             close_position=False, order_type="TAKE_PROFIT_MARKET",
