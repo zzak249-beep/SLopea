@@ -355,30 +355,39 @@ class BingXClient:
 
     async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
         """
-        BingX leverage endpoint acepta side=LONG/SHORT en Hedge Mode.
+        Configura leverage para el símbolo.
         Cache en memoria: sólo llama la API una vez por símbolo por sesión.
-        Esto evita el rate-limit 100410 que se dispara al llamarlo por cada señal.
+        - code=0      → éxito
+        - code=100410 → rate-limit o ya configurado → tratamos como OK y cacheamos
+        - otros codes → warning pero NO bloqueamos la entrada (leverage previo sigue activo)
         """
         cache_key = f"{symbol}:{leverage}"
         if cache_key in self._leverage_cache:
             return True
 
-        ok = True
-        for lev_side in ("LONG", "SHORT"):
-            data = await self._post(
-                "/openApi/swap/v2/trade/leverage",
-                {"symbol": symbol, "side": lev_side, "leverage": str(leverage)},
-            )
-            code = data.get("code", -1)
-            if code not in (0, 100410):   # 100410 = ya configurado / rate-limit temporal
-                log.warning("[%s] set_leverage side=%s → code=%s msg=%s",
-                            symbol, lev_side, code, data.get("msg", "")[:200])
-                ok = False
-            await asyncio.sleep(0.2)     # pequeña pausa entre LONG y SHORT
+        # Llamar solo para LONG (en Hedge Mode BingX sincroniza ambos lados automáticamente)
+        data = await self._post(
+            "/openApi/swap/v2/trade/leverage",
+            {"symbol": symbol, "side": "LONG", "leverage": str(leverage)},
+        )
+        code = data.get("code", -1)
 
-        if ok:
+        if code == 0:
             self._leverage_cache.add(cache_key)
-        return ok
+            log.debug("[%s] leverage=%dx configurado OK", symbol, leverage)
+            return True
+        elif code == 100410:
+            # Rate-limit temporal o ya configurado — asumimos que está bien y cacheamos
+            self._leverage_cache.add(cache_key)
+            log.info("[%s] leverage: 100410 (rate-limit/ya configurado) → OK, cacheado", symbol)
+            return True
+        else:
+            # Otro error — loggeamos pero NO bloqueamos la entrada
+            log.warning("[%s] set_leverage code=%s msg=%s → continuando igual",
+                        symbol, code, data.get("msg", "")[:200])
+            # Cachear de todas formas para no reintentar en cada señal
+            self._leverage_cache.add(cache_key)
+            return False
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
 
@@ -502,8 +511,10 @@ class BingXClient:
         except Exception as e:
             log.warning("[%s] no se pudo validar notional: %s", symbol, e)
 
-        # 1. Leverage
-        await self.set_leverage(symbol, C.LEVERAGE, direction)
+        # 1. Leverage (no bloqueante — si falla, el leverage previo sigue activo)
+        lev_ok = await self.set_leverage(symbol, C.LEVERAGE, direction)
+        if not lev_ok:
+            log.info("[%s] leverage no confirmado pero continuando con entrada", symbol)
 
         # 2. Entrada
         entry_resp = await self.place_market_order(symbol, side_entry, quantity, direction)
