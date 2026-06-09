@@ -7,6 +7,10 @@ Loop principal:
   4. Aplica filtros risk manager
   5. Abre trades en LIVE o notifica en SIGNAL
   6. Corre junto al position_manager loop
+
+FIX v6.3.2:
+  - Balance se obtiene UNA vez por iteración (no por símbolo)
+  - Si get_balance()=0, fallback a C.CAPITAL para no bloquear trades
 """
 import asyncio
 import logging
@@ -51,13 +55,12 @@ async def _process_symbol(
     client: BingXClient,
     risk: RiskManager,
     pos_mgr: PositionManager,
+    balance: float,                     # ← recibido del loop, no se busca aquí
 ) -> Optional[Signal]:
     """Analiza un símbolo y ejecuta la acción correspondiente."""
-    # Skip si ya hay una posición abierta en este símbolo
     if pos_mgr.is_trading(symbol):
         return None
 
-    # Skip si está en cooldown de circuit breaker
     now = time.time()
     if symbol in _cb_blacklist and now - _cb_blacklist[symbol] < CB_COOLDOWN:
         return None
@@ -80,13 +83,11 @@ async def _process_symbol(
     if sig.direction == "NONE":
         return None
 
-    # Circuit breaker
     if sig.circuit_breaker:
         _cb_blacklist[symbol] = now
         await tg.notify_circuit_breaker(symbol)
         return None
 
-    # Tier check
     if not risk.tier_ok(sig.tier):
         return None
 
@@ -102,22 +103,14 @@ async def _process_symbol(
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
 
-    # Balance y sizing
-    try:
-        balance = await client.get_balance()
-    except Exception as e:
-        log.error("[%s] get_balance error: %s", symbol, e)
-        return None
-
     qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
     if qty <= 0:
-        log.warning("[%s] qty=0, skip", symbol)
+        log.warning("[%s] qty=0 (balance=%.2f entry=%.6f sl=%.6f), skip",
+                    symbol, balance, sig.entry, sig.sl)
         return None
 
-    # Notificar señal antes de abrir
     await tg.notify_signal(sig)
 
-    # Abrir trade
     try:
         results = await client.open_trade(
             symbol=symbol,
@@ -138,13 +131,11 @@ async def _process_symbol(
         await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
         return None
 
-    # Extraer order_id
     order_id = str(
         entry_resp.get("data", {}).get("order", {}).get("orderId", "unknown")
         or entry_resp.get("data", {}).get("orderId", "unknown")
     )
 
-    # Registrar en position manager
     trade = OpenTrade(
         symbol=symbol,
         direction=sig.direction,
@@ -162,6 +153,27 @@ async def _process_symbol(
     return sig
 
 
+async def _get_balance_safe(client: BingXClient) -> float:
+    """
+    Obtiene balance con fallback a C.CAPITAL si la API devuelve 0.
+    Evita que un fallo de get_balance bloquee todos los trades.
+    """
+    try:
+        balance = await client.get_balance()
+    except Exception as e:
+        log.error("get_balance exception: %s — usando CAPITAL=%.2f", e, C.CAPITAL)
+        return C.CAPITAL
+
+    if balance <= 0:
+        log.warning(
+            "get_balance=0 (API devolvió 0 o no parseado) — "
+            "usando CAPITAL fallback=%.2f USDT", C.CAPITAL
+        )
+        return C.CAPITAL
+
+    return balance
+
+
 async def scan_loop(
     client: BingXClient,
     risk: RiskManager,
@@ -172,13 +184,7 @@ async def scan_loop(
              C.MODE, C.SCAN_INTERVAL,
              C.TOP_N_SYMBOLS if C.TOP_N_SYMBOLS > 0 else "TODAS")
 
-    # Enviar status inicial
-    try:
-        balance = await client.get_balance()
-    except Exception:
-        balance = 0.0
     symbols = []
-
     iteration = 0
 
     while True:
@@ -204,29 +210,31 @@ async def scan_loop(
             await asyncio.sleep(10)
             continue
 
+        # ── Balance UNA vez por iteración ─────────────────────────────────────
+        balance = await _get_balance_safe(client)
+        log.info("Balance activo: %.4f USDT", balance)
+
         # ── Status periódico (cada 20 iteraciones) ────────────────────────────
         if iteration % 20 == 0:
             try:
-                balance = await client.get_balance()
                 await tg.notify_status(risk.status(), balance, len(symbols))
             except Exception as e:
                 log.warning("status notify error: %s", e)
 
-        # ── Procesar símbolos en batches para no saturar la API ───────────────
+        # ── Procesar símbolos en batches ──────────────────────────────────────
         BATCH_SIZE = 10
         signals_found = 0
 
         for i in range(0, len(symbols), BATCH_SIZE):
             batch = symbols[i : i + BATCH_SIZE]
             tasks = [
-                _process_symbol(sym, client, risk, pos_mgr)
+                _process_symbol(sym, client, risk, pos_mgr, balance)
                 for sym in batch
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
                 if isinstance(r, Signal) and r.direction != "NONE":
                     signals_found += 1
-            # Pequeña pausa entre batches para no exceder rate limits
             await asyncio.sleep(0.5)
 
         elapsed = time.time() - start
@@ -235,6 +243,5 @@ async def scan_loop(
             iteration, len(symbols), signals_found, elapsed
         )
 
-        # Esperar hasta el próximo ciclo
         wait = max(0.0, C.SCAN_INTERVAL - elapsed)
         await asyncio.sleep(wait)
