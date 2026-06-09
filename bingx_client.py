@@ -2,6 +2,8 @@
 QF×JP Bot v6.3 — BingX Client
 Maneja: klines, símbolos, órdenes MARKET, SL/TP, cierre de posiciones,
 consulta de posiciones abiertas y cancelación de órdenes pendientes.
+
+FIX v6.3.1: recvWindow=10000 en _signed_params para evitar Signature mismatch.
 """
 import hmac
 import hashlib
@@ -24,6 +26,7 @@ def _ts() -> str:
 
 def _sign(params: dict) -> str:
     query = urlencode(sorted(params.items()))
+    log.debug("SIGNING: %s", query)
     return hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
         query.encode("utf-8"),
@@ -31,8 +34,9 @@ def _sign(params: dict) -> str:
     ).hexdigest()
 
 def _signed_params(params: dict) -> dict:
-    params["timestamp"] = _ts()
-    params["signature"] = _sign(params)
+    params["timestamp"]  = _ts()
+    params["recvWindow"] = "10000"          # FIX: evita Signature mismatch
+    params["signature"]  = _sign(params)
     return params
 
 # ── Cliente base ─────────────────────────────────────────────────────────────
@@ -105,18 +109,14 @@ class BingXClient:
     # ── Mercado ───────────────────────────────────────────────────────────────
 
     async def get_all_symbols(self) -> list[str]:
-        """Devuelve TODOS los pares USDT de perpetuos BingX con volumen mínimo.
-        Maneja múltiples formatos de respuesta del endpoint de contratos.
-        """
+        """Devuelve TODOS los pares USDT de perpetuos BingX con volumen mínimo."""
         data = await self._get("/openApi/swap/v2/quote/contracts")
         raw = data.get("data", [])
 
-        # BingX a veces envuelve la lista en otro nivel
         if isinstance(raw, dict):
             raw = raw.get("contracts", raw.get("list", []))
 
         if not isinstance(raw, list) or len(raw) == 0:
-            # Fallback: usar endpoint de tickers que siempre devuelve lista plana
             log.warning("get_all_symbols: contracts vacío, usando tickers fallback")
             ticker_data = await self._get("/openApi/swap/v2/quote/premiumIndex")
             raw = ticker_data.get("data", [])
@@ -125,30 +125,24 @@ class BingXClient:
 
         symbols = []
         vol_map = {}
-        vol_detected = 0  # DEBUG: cuántos símbolos tienen volumen detectado
+        vol_detected = 0
 
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            # BingX usa 'symbol' en contratos y tickers
             sym = item.get("symbol", "")
             if not sym:
                 continue
-            # Normalizar: BTC-USDT o BTCUSDT → siempre BTC-USDT
             if "-" not in sym and sym.endswith("USDT"):
                 sym = sym[:-4] + "-USDT"
             if not sym.endswith("-USDT"):
                 continue
             if sym in C.BLACKLIST:
                 continue
-            # Filtro sintéticos
             base = sym.replace("-USDT", "")
             if any(base.startswith(p) for p in ("BEAR", "BULL", "PUMP", "NCS")):
                 continue
 
-            # ── FIX: campo de volumen ampliado ────────────────────────────────
-            # BingX cambió nombres de campos entre versiones de la API.
-            # Se prueba todos los nombres conocidos.
             vol_raw = (
                 item.get("volume24h") or item.get("vol24h") or
                 item.get("quoteVolume") or item.get("turnover24h") or
@@ -162,15 +156,11 @@ class BingXClient:
                 vol_detected += 1
             vol_map[sym] = vol
 
-            # ── FIX CRÍTICO: solo filtrar cuando el volumen ES CONOCIDO ───────
-            # Si vol=0 significa que no detectamos el campo → incluir símbolo
-            # Si vol>0 y está bajo el mínimo → excluir
             if C.MIN_VOLUME_USDT > 0 and vol > 0 and vol < C.MIN_VOLUME_USDT:
                 continue
 
             symbols.append(sym)
 
-        # Ordenar por volumen descendente (los sin volumen van al final)
         symbols.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
 
         if C.TOP_N_SYMBOLS > 0:
@@ -180,8 +170,6 @@ class BingXClient:
             "get_all_symbols: %d símbolos válidos (raw=%d, con_vol=%d)",
             len(symbols), len(raw), vol_detected,
         )
-        # Si vol_detected=0 significa que el campo de volumen no se detectó —
-        # el bot sigue funcionando pero el filtro MIN_VOLUME_USDT no aplica.
         if vol_detected == 0 and len(raw) > 0:
             log.warning(
                 "⚠️  Volumen no detectado en ningún símbolo — "
@@ -190,9 +178,6 @@ class BingXClient:
         return symbols
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[list]:
-        """
-        Retorna lista de velas: [open_time, open, high, low, close, volume, ...]
-        """
         data = await self._get(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
@@ -225,7 +210,6 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        """Retorna balance disponible en USDT."""
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
