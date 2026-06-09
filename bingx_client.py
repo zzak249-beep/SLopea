@@ -22,28 +22,18 @@ log = logging.getLogger("bingx")
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(query_string: str) -> str:
-    """HMAC-SHA256 sobre el query string ya construido (sin signature)."""
+def _sign(params: dict) -> str:
+    query = urlencode(sorted(params.items()))
     return hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
-        query_string.encode("utf-8"),
+        query.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
-def _build_query(params: dict) -> str:
-    """Construye query string en orden de inserción (sin ordenar)."""
-    return urlencode(params)
-
-def _signed_query(params: dict) -> str:
-    """
-    Devuelve el query string completo incluyendo signature al final.
-    BingX firma los params en orden de inserción y añade &signature=xxx al final.
-    """
-    p = dict(params)
-    p["timestamp"] = _ts()
-    qs = _build_query(p)
-    sig = _sign(qs)
-    return f"{qs}&signature={sig}"
+def _signed_params(params: dict) -> dict:
+    params["timestamp"] = _ts()
+    params["signature"] = _sign(params)
+    return params
 
 # ── Cliente base ─────────────────────────────────────────────────────────────
 
@@ -56,7 +46,10 @@ class BingXClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"X-BX-APIKEY": C.BINGX_API_KEY},
+                headers={
+                    "X-BX-APIKEY": C.BINGX_API_KEY,
+                    "Content-Type": "application/json",
+                },
                 timeout=aiohttp.ClientTimeout(total=15),
             )
         return self._session
@@ -67,55 +60,44 @@ class BingXClient:
 
     async def _get(self, path: str, params: dict | None = None, signed: bool = False) -> dict:
         session = await self._get_session()
-        base_params = params or {}
+        p = params or {}
+        if signed:
+            p = _signed_params(p)
         for attempt in range(3):
             try:
-                if signed:
-                    qs = _signed_query(base_params)
-                    url = f"{self.BASE}{path}?{qs}"
-                else:
-                    url = f"{self.BASE}{path}"
-                    if base_params:
-                        url += "?" + _build_query(base_params)
-                async with session.get(url) as r:
-                    data = await r.json(content_type=None)
+                async with session.get(f"{self.BASE}{path}", params=p) as r:
+                    data = await r.json()
                     return data
             except Exception as e:
                 if attempt == 2:
-                    log.error("GET %s falló tras 3 intentos: %s", path, e)
                     raise
                 await asyncio.sleep(1.5 ** attempt)
         return {}
 
     async def _post(self, path: str, params: dict) -> dict:
         session = await self._get_session()
+        p = _signed_params(params)
         for attempt in range(3):
             try:
-                qs = _signed_query(params)
-                url = f"{self.BASE}{path}?{qs}"
-                # BingX: params van en query string, body vacío
-                async with session.post(url, data="") as r:
-                    data = await r.json(content_type=None)
+                async with session.post(f"{self.BASE}{path}", params=p) as r:
+                    data = await r.json()
                     return data
             except Exception as e:
                 if attempt == 2:
-                    log.error("POST %s falló tras 3 intentos: %s", path, e)
                     raise
                 await asyncio.sleep(1.5 ** attempt)
         return {}
 
     async def _delete(self, path: str, params: dict) -> dict:
         session = await self._get_session()
+        p = _signed_params(params)
         for attempt in range(3):
             try:
-                qs = _signed_query(params)
-                url = f"{self.BASE}{path}?{qs}"
-                async with session.delete(url) as r:
-                    data = await r.json(content_type=None)
+                async with session.delete(f"{self.BASE}{path}", params=p) as r:
+                    data = await r.json()
                     return data
             except Exception as e:
                 if attempt == 2:
-                    log.error("DELETE %s falló tras 3 intentos: %s", path, e)
                     raise
                 await asyncio.sleep(1.5 ** attempt)
         return {}
@@ -123,87 +105,86 @@ class BingXClient:
     # ── Mercado ───────────────────────────────────────────────────────────────
 
     async def get_all_symbols(self) -> list[str]:
+        """Devuelve TODOS los pares USDT de perpetuos BingX con volumen mínimo.
+        Maneja múltiples formatos de respuesta del endpoint de contratos.
         """
-        Devuelve pares USDT de perpetuos BingX que superen MIN_VOLUME_USDT.
-        Usa /ticker (todos) para obtener volumen real en USDT.
-        """
-        # ── Paso 1: obtener tickers con volumen 24h ───────────────────────────
-        ticker_data = await self._get("/openApi/swap/v2/quote/ticker")
-        tickers_raw = ticker_data.get("data", [])
-        if isinstance(tickers_raw, dict):
-            tickers_raw = tickers_raw.get("tickers", tickers_raw.get("list", []))
+        data = await self._get("/openApi/swap/v2/quote/contracts")
+        raw = data.get("data", [])
 
-        # Construir mapa symbol → volumen USDT 24h
-        # BingX ticker fields: symbol, quoteVolume (USDT), volume (base coin)
-        vol_map: dict[str, float] = {}
-        for t in (tickers_raw if isinstance(tickers_raw, list) else []):
-            sym = t.get("symbol", "")
+        # BingX a veces envuelve la lista en otro nivel
+        if isinstance(raw, dict):
+            raw = raw.get("contracts", raw.get("list", []))
+
+        if not isinstance(raw, list) or len(raw) == 0:
+            # Fallback: usar endpoint de tickers que siempre devuelve lista plana
+            log.warning("get_all_symbols: contracts vacío, usando tickers fallback")
+            ticker_data = await self._get("/openApi/swap/v2/quote/premiumIndex")
+            raw = ticker_data.get("data", [])
+            if not isinstance(raw, list):
+                raw = []
+
+        symbols = []
+        vol_map = {}
+
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            # BingX usa 'symbol' en contratos y tickers
+            sym = item.get("symbol", "")
+            if not sym:
+                continue
+            # Normalizar: BTC-USDT o BTCUSDT → siempre BTC-USDT
+            if "-" not in sym and sym.endswith("USDT"):
+                sym = sym[:-4] + "-USDT"
             if not sym.endswith("-USDT"):
                 continue
-            # quoteVolume es en USDT, volume es en moneda base
-            vol = float(
-                t.get("quoteVolume", 0) or
-                t.get("volume", 0) or 0
-            )
-            vol_map[sym] = vol
-
-        log.debug("get_all_symbols: %d tickers con volumen USDT", len(vol_map))
-
-        # ── Paso 2: filtrar por volumen y blacklist ───────────────────────────
-        symbols = []
-        for sym, vol in vol_map.items():
             if sym in C.BLACKLIST:
                 continue
+            # Filtro sintéticos
+            base = sym.replace("-USDT", "")
+            if any(base.startswith(p) for p in ("BEAR", "BULL", "PUMP", "NCS")):
+                continue
+            # Volumen 24h — distintos campos según endpoint
+            vol = float(
+                item.get("volume24h") or item.get("vol24h") or
+                item.get("quoteVolume") or item.get("turnover24h") or 0
+            )
+            vol_map[sym] = vol
             if C.MIN_VOLUME_USDT > 0 and vol < C.MIN_VOLUME_USDT:
                 continue
             symbols.append(sym)
 
-        log.info(
-            "get_all_symbols: %d contratos raw, %d pasan filtro volumen (min=%.0f USDT)",
-            len(vol_map), len(symbols), C.MIN_VOLUME_USDT,
-        )
-
-        # ── Paso 3: ordenar y limitar ─────────────────────────────────────────
+        # Ordenar por volumen descendente
         symbols.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+
         if C.TOP_N_SYMBOLS > 0:
             symbols = symbols[: C.TOP_N_SYMBOLS]
 
+        log.info("get_all_symbols: %d símbolos válidos (raw=%d)", len(symbols), len(raw))
         return symbols
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[list]:
         """
         Retorna lista de velas: [open_time, open, high, low, close, volume, ...]
-        Compatible con BingX swap/v3/quote/klines y swap/v2/quote/klines.
         """
         data = await self._get(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
         )
         raw = data.get("data", [])
-
-        # Algunos endpoints devuelven {"data": {"klines": [...]}}
-        if isinstance(raw, dict):
-            raw = raw.get("klines", raw.get("data", []))
-
-        if not raw or not isinstance(raw, list):
+        if not raw:
             return []
-
         result = []
         for c in raw:
             try:
-                # Formato objeto: {"time":..., "open":..., "high":..., "low":..., "close":..., "volume":...}
-                if isinstance(c, dict):
-                    result.append([
-                        int(c.get("time", c.get("openTime", 0))),
-                        float(c.get("open", c.get("o", 0))),
-                        float(c.get("high", c.get("h", 0))),
-                        float(c.get("low", c.get("l", 0))),
-                        float(c.get("close", c.get("c", 0))),
-                        float(c.get("volume", c.get("v", 0))),
-                    ])
-                # Formato array: [time, open, high, low, close, volume]
-                elif isinstance(c, (list, tuple)) and len(c) >= 6:
-                    result.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+                result.append([
+                    int(c["time"]),
+                    float(c["open"]),
+                    float(c["high"]),
+                    float(c["low"]),
+                    float(c["close"]),
+                    float(c["volume"]),
+                ])
             except Exception:
                 continue
         return sorted(result, key=lambda x: x[0])
@@ -218,45 +199,49 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        """Retorna balance disponible en USDT (availableMargin)."""
+        """Retorna balance disponible en USDT.
+        BingX puede devolver data como:
+          - lista directa: [{'asset':'USDT','availableMargin':'0.42',...}, ...]
+          - dict con key balance: {'balance': [...]}
+          - dict plano: {'asset':'USDT','availableMargin':'0.42'}
+        """
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
             signed=True,
         )
-        try:
-            # Estructura real de BingX:
-            # {"code":0, "msg":"", "data": [{"userId":"...", "asset":"USDT",
-            #   "balance":"254.77", "availableMargin":"0.42", ...}, ...]}
-            payload = data.get("data", data)   # si no hay "data" usa el root
+        raw = data.get("data", {})
 
-            # Caso 1: data es una lista de assets directamente
-            if isinstance(payload, list):
-                for a in payload:
-                    if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                        return float(a.get("availableMargin", 0))
-                # Si no hay asset USDT explícito, devuelve el primero disponible
-                for a in payload:
-                    if isinstance(a, dict) and "availableMargin" in a:
-                        return float(a["availableMargin"])
-
-            # Caso 2: data es un dict con clave "balance" que es lista
-            if isinstance(payload, dict):
-                bal = payload.get("balance", payload)
-                if isinstance(bal, list):
-                    for a in bal:
-                        if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                            return float(a.get("availableMargin", 0))
-                elif isinstance(bal, dict) and "availableMargin" in bal:
-                    return float(bal["availableMargin"])
-                elif "availableMargin" in payload:
-                    return float(payload["availableMargin"])
-
-            log.warning("get_balance: no se encontró USDT en payload=%s", str(payload)[:300])
+        # Caso 1: data es lista directa  → [{'asset':'USDT', ...}, ...]
+        if isinstance(raw, list):
+            for a in raw:
+                if a.get("asset", "") == "USDT":
+                    return float(a.get("availableMargin", 0) or 0)
+            # Si no hay USDT busca el primero con availableMargin
+            for a in raw:
+                v = a.get("availableMargin")
+                if v is not None:
+                    return float(v or 0)
             return 0.0
-        except Exception as e:
-            log.warning("get_balance error: %s | data=%s", e, str(data)[:300])
-            return 0.0
+
+        # Caso 2: data es dict con key 'balance' que es lista
+        if isinstance(raw, dict):
+            bal = raw.get("balance", raw)
+            if isinstance(bal, list):
+                for a in bal:
+                    if a.get("asset", "") == "USDT":
+                        return float(a.get("availableMargin", 0) or 0)
+            # Caso 3: dict plano {'asset':'USDT','availableMargin':'0.42'}
+            if isinstance(bal, dict):
+                return float(bal.get("availableMargin", 0) or 0)
+            # Caso 4: valor numérico directo
+            try:
+                return float(bal)
+            except Exception:
+                pass
+
+        log.warning("get_balance: formato no reconocido %s", str(data)[:200])
+        return 0.0
 
     # ── Posiciones abiertas ────────────────────────────────────────────────────
 
@@ -264,7 +249,7 @@ class BingXClient:
         """Lista de posiciones abiertas en BingX Perpetual."""
         data = await self._get(
             "/openApi/swap/v2/user/positions",
-            None,
+            {},
             signed=True,
         )
         positions = data.get("data", [])
