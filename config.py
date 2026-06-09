@@ -63,7 +63,7 @@ SCAN_INTERVAL   = _int("SCAN_INTERVAL", 180)
 # TOP_N_SYMBOLS=0 → TODAS las monedas de BingX
 TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 0)
 BLACKLIST       = set(_list("BLACKLIST", ""))
-MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 5_000_000.0)  # filtro mínimo 5M USDT/24h
+MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 0.0)  # 0 = sin filtro
 
 # ── Timeframes ────────────────────────────────────────
 TIMEFRAME        = os.getenv("TIMEFRAME", "3m")
