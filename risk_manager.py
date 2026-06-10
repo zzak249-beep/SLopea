@@ -1,7 +1,13 @@
 """
-QF×JP Bot v6.5 — Risk Manager
+QF×JP Bot v6.5.1 — Risk Manager
 
-CAMBIOS v6.5 vs v6.4:
+FIX v6.5.1:
+  [FIX] MIN_SL_PCT guard: umbral ahora DEPENDE DEL TIER en lugar de ser fijo 0.3%.
+        STD=0.15% / FUEL=0.20% / SUP=0.25% / SUPREMA=0.30%
+        El 0.3% fijo rechazaba señales válidas en micro-caps (ERA, ZKP, SHIB)
+        donde el ATR natural está entre 0.15-0.28%.
+
+HISTORIAL v6.5:
   [FIX]  MIN_SL_PCT guard: descarta señales donde el SL está demasiado
          cerca del entry (< 0.3% del precio). Evita qty explosiva en
          micro-caps como SHIB (SL a 1 pip → 210M contratos → 977 USDT).
@@ -41,6 +47,15 @@ _KELLY_SCALE_REF    = 0.10    # kelly_f que mapea a kelly_scale = 1.0
 # Jerarquía de tiers (compartida entre métodos)
 _TIER_HIERARCHY = {"NONE": -1, "STD": 0, "FUEL": 1, "SUP": 2, "SUPREMA": 3}
 _TIER_MULT      = {"STD": 1.0, "FUEL": 1.1, "SUP": 1.25, "SUPREMA": 1.4}
+
+# FIX v6.5.1: SL mínimo por tier — el 0.3% fijo rechazaba micro-caps válidos
+# STD  0.15% | FUEL  0.20% | SUP  0.25% | SUPREMA  0.30%
+_TIER_MIN_SL_PCT = {
+    "STD":     0.0015,
+    "FUEL":    0.0020,
+    "SUP":     0.0025,
+    "SUPREMA": 0.0030,
+}
 
 
 class RiskManager:
@@ -113,13 +128,16 @@ class RiskManager:
             log.warning("[sizing] SL=entry (%.8f) → skip", entry)
             return 0.0
 
-        # ── Guard: SL mínimo como % del entry (evita qty explosiva micro-caps) ─
-        min_sl_pct        = getattr(C, "MIN_SL_PCT", 0.003)   # default 0.3%
+        # ── FIX v6.5.1: SL mínimo por tier (evita qty explosiva micro-caps) ──
+        # Umbral adaptativo: STD=0.15% | FUEL=0.20% | SUP=0.25% | SUPREMA=0.30%
+        # Config override disponible via C.MIN_SL_PCT (aplica a todos los tiers
+        # si se define, o usa _TIER_MIN_SL_PCT si no está en config)
+        min_sl_pct        = _TIER_MIN_SL_PCT.get(tier, getattr(C, "MIN_SL_PCT", 0.0020))
         min_risk_per_unit = entry * min_sl_pct
         if risk_per_unit < min_risk_per_unit:
             actual_pct = 100.0 * risk_per_unit / entry
             log.warning(
-                "[sizing] SL demasiado apretado %.4f%% < %.1f%% → skip (%s)",
+                "[sizing] SL demasiado apretado %.4f%% < %.2f%% → skip (%s)",
                 actual_pct, min_sl_pct * 100, tier,
             )
             return 0.0
@@ -167,9 +185,10 @@ class RiskManager:
 
         log.info(
             "[sizing] %s score=%.1f ks=%.2f risk=%.2f USDT "
-            "qty=%.6f notional=%.2f USDT (entry=%.8f SL=%.8f)",
+            "qty=%.6f notional=%.2f USDT (entry=%.8f SL=%.8f sl_pct=%.3f%%)",
             tier, score, kelly_scale, risk_usdt,
             qty, notional, entry, sl,
+            100.0 * risk_per_unit / entry,
         )
         return round(qty, 6)
 
