@@ -9,6 +9,12 @@ que reordenaba los params y rompía la firma.
 
 FIX v6.3.3: stepSize cache — redondea quantity al stepSize del símbolo
 antes de enviar órdenes. Evita error 109400 "Invalid parameters".
+
+FIX v6.3.5: get_all_symbols — fallback a /ticker para volumen cuando
+/contracts devuelve con_vol=0. MIN_VOLUME_USDT ya funciona.
+
+FIX v6.3.5: get_symbol_precision — lee volumePrecision (campo real BingX,
+int = nº de decimales). Evita error 109400 en altcoins como WLD, ARK, etc.
 """
 import hmac
 import hashlib
@@ -38,14 +44,12 @@ def _build_signed_url(base: str, path: str, params: dict) -> str:
     """
     params["timestamp"]  = _ts()
     params["recvWindow"] = "10000"
-    # Firma sobre el query string SIN signature (orden tal cual)
     query = urlencode(params)
     sig = hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
         query.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    # signature va AL FINAL
     return f"{base}{path}?{query}&signature={sig}"
 
 
@@ -58,7 +62,7 @@ class BingXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         # Cache de stepSize: {symbol: (qty_step, price_step)}
         self._precision_cache: dict[str, tuple[float, float]] = {}
-        # Cache de leverage configurado: {"SYMBOL:leverage"} — evita rate-limit 100410
+        # Cache de leverage configurado — evita rate-limit 100410
         self._leverage_cache: set[str] = set()
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -126,8 +130,50 @@ class BingXClient:
 
     # ── Mercado ───────────────────────────────────────────────────────────────
 
+    async def _fetch_ticker_volumes(self) -> dict[str, float]:
+        """
+        Obtiene volumen 24h en USDT para todos los pares desde /ticker.
+        Retorna {symbol: vol_usdt}. Usado como fallback cuando /contracts
+        no devuelve datos de volumen (con_vol=0).
+        """
+        vol_map: dict[str, float] = {}
+        try:
+            data = await self._get("/openApi/swap/v2/quote/ticker")
+            tickers = data.get("data", [])
+            if not isinstance(tickers, list):
+                tickers = []
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if not sym:
+                    continue
+                if "-" not in sym and sym.endswith("USDT"):
+                    sym = sym[:-4] + "-USDT"
+                if not sym.endswith("-USDT"):
+                    continue
+                # quoteVolume = volumen en USDT (lo que queremos)
+                # volume      = volumen en moneda base (menos útil para filtrar)
+                vol = float(
+                    t.get("quoteVolume") or
+                    t.get("turnover") or
+                    t.get("vol") or
+                    t.get("volume") or 0
+                )
+                if vol > 0:
+                    vol_map[sym] = vol
+        except Exception as e:
+            log.warning("_fetch_ticker_volumes error: %s", e)
+        return vol_map
+
     async def get_all_symbols(self) -> list[str]:
-        """Devuelve TODOS los pares USDT de perpetuos BingX con volumen mínimo."""
+        """
+        Devuelve todos los pares USDT de perpetuos BingX con volumen mínimo.
+
+        Flujo:
+        1. /contracts → lista de símbolos + intento de volumen
+        2. Si con_vol=0 → fallback a /ticker para volumen (FIX v6.3.5)
+        3. Filtra por MIN_VOLUME_USDT, BLACKLIST, tokens sintéticos
+        4. Ordena por volumen desc, aplica TOP_N
+        """
         data = await self._get("/openApi/swap/v2/quote/contracts")
         raw = data.get("data", [])
 
@@ -141,8 +187,8 @@ class BingXClient:
             if not isinstance(raw, list):
                 raw = []
 
-        symbols = []
-        vol_map = {}
+        symbols_raw: list[str] = []
+        vol_map: dict[str, float] = {}
         vol_detected = 0
 
         for item in raw:
@@ -158,14 +204,13 @@ class BingXClient:
             if sym in C.BLACKLIST:
                 continue
             base = sym.replace("-USDT", "")
-            # Filtrar tokens sintéticos, apalancados e índices forex (no operables via API)
             if any(base.startswith(p) for p in (
                 "BEAR", "BULL", "PUMP", "NCS",
-                "NCFX",          # índices forex sintéticos NCFX (GBP/SGD, EUR/USD, etc.)
-                "DOWN", "UP",    # tokens apalancados tipo DOWN/UP
+                "NCFX", "DOWN", "UP",
             )):
                 continue
 
+            # Intentar leer volumen desde /contracts
             vol_raw = (
                 item.get("volume24h") or item.get("vol24h") or
                 item.get("quoteVolume") or item.get("turnover24h") or
@@ -177,28 +222,44 @@ class BingXClient:
             vol = float(vol_raw) if vol_raw else 0.0
             if vol > 0:
                 vol_detected += 1
-            vol_map[sym] = vol
+                vol_map[sym] = vol
 
-            if C.MIN_VOLUME_USDT > 0 and vol > 0 and vol < C.MIN_VOLUME_USDT:
-                continue
+            symbols_raw.append(sym)
 
-            symbols.append(sym)
+        # ── FIX v6.3.5: Fallback a /ticker si /contracts no devolvió volumen ──
+        if vol_detected == 0 and len(symbols_raw) > 0:
+            log.info("get_all_symbols: con_vol=0 → fetching volumen desde /ticker")
+            ticker_vols = await self._fetch_ticker_volumes()
+            if ticker_vols:
+                vol_map.update(ticker_vols)
+                vol_detected = len(ticker_vols)
+                log.info("get_all_symbols: volumen obtenido desde /ticker para %d símbolos", vol_detected)
+            else:
+                log.warning(
+                    "⚠️  Volumen no disponible en /contracts ni /ticker — "
+                    "MIN_VOLUME_USDT ignorado."
+                )
 
-        symbols.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+        # ── Aplicar filtro de volumen mínimo ─────────────────────────────────
+        if C.MIN_VOLUME_USDT > 0 and vol_detected > 0:
+            symbols_filtered = [
+                s for s in symbols_raw
+                if vol_map.get(s, 0) >= C.MIN_VOLUME_USDT
+            ]
+        else:
+            symbols_filtered = symbols_raw
+
+        # ── Ordenar por volumen desc ──────────────────────────────────────────
+        symbols_filtered.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
 
         if C.TOP_N_SYMBOLS > 0:
-            symbols = symbols[: C.TOP_N_SYMBOLS]
+            symbols_filtered = symbols_filtered[: C.TOP_N_SYMBOLS]
 
         log.info(
             "get_all_symbols: %d símbolos válidos (raw=%d, con_vol=%d)",
-            len(symbols), len(raw), vol_detected,
+            len(symbols_filtered), len(raw), vol_detected,
         )
-        if vol_detected == 0 and len(raw) > 0:
-            log.warning(
-                "⚠️  Volumen no detectado en ningún símbolo — "
-                "MIN_VOLUME_USDT ignorado. Revisar campos del endpoint."
-            )
-        return symbols
+        return symbols_filtered
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[list]:
         data = await self._get(
@@ -230,14 +291,19 @@ class BingXClient:
         )
         return data.get("data", {})
 
-    # ── Precisión de símbolo (stepSize) ─────────────────────────────────────────
+    # ── Precisión de símbolo (stepSize / volumePrecision) ────────────────────
 
     async def get_symbol_precision(self, symbol: str) -> tuple[float, float]:
         """
         Retorna (qty_step, price_step) para el símbolo.
         Usa caché en memoria para no llamar la API en cada orden.
-        qty_step  → mínimo incremento de cantidad (ej: 1.0, 0.1, 0.001)
-        price_step → mínimo incremento de precio (ej: 0.001, 0.01)
+
+        qty_step   → mínimo incremento de cantidad  (ej: 1.0, 0.1, 0.001)
+        price_step → mínimo incremento de precio    (ej: 0.001, 0.01)
+
+        FIX v6.3.5: Lee volumePrecision primero (campo real de BingX).
+        volumePrecision es un entero que indica el número de decimales:
+          0 → step=1, 1 → step=0.1, 2 → step=0.01, 3 → step=0.001, etc.
         """
         if symbol in self._precision_cache:
             return self._precision_cache[symbol]
@@ -257,31 +323,44 @@ class BingXClient:
                 if sym != symbol:
                     continue
 
-                # Intentar varios campos de stepSize de cantidad
-                qty_step = float(
-                    item.get("tradeMinQuantity") or
-                    item.get("stepSize") or
-                    item.get("quantityStep") or
-                    item.get("lotSize") or
-                    item.get("minQty") or 1
-                )
-                # Intentar varios campos de stepSize de precio
-                price_step = float(
-                    item.get("pricePrecision") or
-                    item.get("tickSize") or
-                    item.get("priceStep") or 0.0001
-                )
-                # pricePrecision puede venir como entero (número de decimales)
-                if price_step >= 1:
-                    price_step = 10 ** (-int(price_step))
+                # ── FIX v6.3.5: volumePrecision es el campo real de BingX ──
+                vol_prec_raw = item.get("volumePrecision")
+                if vol_prec_raw is not None:
+                    try:
+                        qty_step = 10.0 ** (-int(float(vol_prec_raw)))
+                    except Exception:
+                        qty_step = 1.0
+                else:
+                    # Fallback: otros posibles campos (APIs antiguas)
+                    qty_step = float(
+                        item.get("tradeMinQuantity") or
+                        item.get("stepSize") or
+                        item.get("quantityStep") or
+                        item.get("lotSize") or
+                        item.get("minQty") or 1
+                    )
+
+                # pricePrecision: puede ser entero (nº decimales) o float directo
+                price_prec_raw = item.get("pricePrecision")
+                if price_prec_raw is not None:
+                    try:
+                        pp = float(price_prec_raw)
+                        price_step = 10.0 ** (-int(pp)) if pp >= 1 else pp
+                    except Exception:
+                        price_step = 0.0001
+                else:
+                    price_step = float(
+                        item.get("tickSize") or
+                        item.get("priceStep") or 0.0001
+                    )
 
                 self._precision_cache[symbol] = (qty_step, price_step)
                 log.debug("[%s] stepSize qty=%.8f price=%.8f", symbol, qty_step, price_step)
                 return (qty_step, price_step)
+
         except Exception as e:
             log.warning("get_symbol_precision(%s) error: %s — usando defaults", symbol, e)
 
-        # Fallback seguro
         defaults = (1.0, 0.0001)
         self._precision_cache[symbol] = defaults
         return defaults
@@ -358,14 +437,13 @@ class BingXClient:
         Configura leverage para el símbolo.
         Cache en memoria: sólo llama la API una vez por símbolo por sesión.
         - code=0      → éxito
-        - code=100410 → rate-limit o ya configurado → tratamos como OK y cacheamos
-        - otros codes → warning pero NO bloqueamos la entrada (leverage previo sigue activo)
+        - code=100410 → rate-limit o ya configurado → OK y cacheamos
+        - otros codes → warning pero NO bloqueamos la entrada
         """
         cache_key = f"{symbol}:{leverage}"
         if cache_key in self._leverage_cache:
             return True
 
-        # Llamar solo para LONG (en Hedge Mode BingX sincroniza ambos lados automáticamente)
         data = await self._post(
             "/openApi/swap/v2/trade/leverage",
             {"symbol": symbol, "side": "LONG", "leverage": str(leverage)},
@@ -377,15 +455,12 @@ class BingXClient:
             log.debug("[%s] leverage=%dx configurado OK", symbol, leverage)
             return True
         elif code == 100410:
-            # Rate-limit temporal o ya configurado — asumimos que está bien y cacheamos
             self._leverage_cache.add(cache_key)
             log.info("[%s] leverage: 100410 (rate-limit/ya configurado) → OK, cacheado", symbol)
             return True
         else:
-            # Otro error — loggeamos pero NO bloqueamos la entrada
             log.warning("[%s] set_leverage code=%s msg=%s → continuando igual",
                         symbol, code, data.get("msg", "")[:200])
-            # Cachear de todas formas para no reintentar en cada señal
             self._leverage_cache.add(cache_key)
             return False
 
@@ -493,13 +568,12 @@ class BingXClient:
             return results
 
         # Validar notional mínimo (BingX requiere >= 5 USDT por orden)
-        # Obtener precio actual para calcular notional
         try:
             ticker = await self.get_ticker(symbol)
             mark_price = float(ticker.get("lastPrice") or ticker.get("markPrice") or 0)
             if mark_price > 0:
                 notional = quantity * mark_price
-                MIN_NOTIONAL = 5.0  # USDT mínimo por orden en BingX
+                MIN_NOTIONAL = 5.0
                 if notional < MIN_NOTIONAL:
                     msg = (f"notional={notional:.4f} USDT < mínimo {MIN_NOTIONAL} USDT "
                            f"(qty={quantity} × price={mark_price:.6f})")
@@ -511,7 +585,7 @@ class BingXClient:
         except Exception as e:
             log.warning("[%s] no se pudo validar notional: %s", symbol, e)
 
-        # 1. Leverage (no bloqueante — si falla, el leverage previo sigue activo)
+        # 1. Leverage (no bloqueante)
         lev_ok = await self.set_leverage(symbol, C.LEVERAGE, direction)
         if not lev_ok:
             log.info("[%s] leverage no confirmado pero continuando con entrada", symbol)
@@ -535,7 +609,7 @@ class BingXClient:
         # 4. TP1 (50% de la qty, redondeado al step)
         qty_half = self._round_qty(quantity / 2, qty_step)
         if qty_half <= 0:
-            qty_half = quantity   # fallback: usar toda la qty
+            qty_half = quantity
         tp1_resp = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
             close_position=False, order_type="TAKE_PROFIT_MARKET",
