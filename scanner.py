@@ -15,6 +15,9 @@ FIX v6.3.4: Notional check en scanner antes de open_trade.
 FIX v6.3.5: notify_signal movido ANTES de risk checks → Telegram
   siempre recibe señales aunque no se abra trade.
   notify_blocked() cuando risk.can_trade() rechaza.
+FIX v6.3.6: Guard geometría de señal — descarta señales con ATR=0,
+  TP=Entry, o SL/TP en lado incorrecto. Evita órdenes degeneradas
+  en micro-caps como ASTEROIDETH-USDT.
 """
 import asyncio
 import logging
@@ -100,6 +103,31 @@ async def _process_symbol(
         return None
 
     log.info("[%s] Señal %s tier=%s score=%.1f", symbol, sig.direction, sig.tier, sig.score)
+
+    # ── FIX v6.3.6: Guard geometría — descarta señales degeneradas ───────────
+    # ATR=0 → los TP quedan pegados al entry → orden inválida en BingX
+    if sig.atr <= 0:
+        log.warning("[%s] descartada: ATR=0 (par micro-cap o velas planas)", symbol)
+        return None
+    # TP igual o peor que entry → no tiene sentido geométrico
+    if sig.direction == "LONG":
+        if sig.tp1 <= sig.entry:
+            log.warning("[%s] LONG descartada: tp1=%.8f <= entry=%.8f",
+                        symbol, sig.tp1, sig.entry)
+            return None
+        if sig.sl >= sig.entry:
+            log.warning("[%s] LONG descartada: sl=%.8f >= entry=%.8f",
+                        symbol, sig.sl, sig.entry)
+            return None
+    else:  # SHORT
+        if sig.tp1 >= sig.entry:
+            log.warning("[%s] SHORT descartada: tp1=%.8f >= entry=%.8f",
+                        symbol, sig.tp1, sig.entry)
+            return None
+        if sig.sl <= sig.entry:
+            log.warning("[%s] SHORT descartada: sl=%.8f <= entry=%.8f",
+                        symbol, sig.sl, sig.entry)
+            return None
 
     # ── FIX v6.3.5: Notificar señal SIEMPRE (antes de cualquier filtro de trade) ──
     # En SIGNAL mode: notificar y salir.
