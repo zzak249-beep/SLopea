@@ -1,5 +1,5 @@
 """
-QF×JP Bot v6.3 — Config
+QF×JP Bot v6.3.1 — Config
 Todas las variables via env vars con defaults seguros.
 """
 import os
@@ -60,8 +60,7 @@ HTF_MIN_ALIGNED   = _int("HTF_MIN_ALIGNED", 2)
 
 # ── Scanner ───────────────────────────────────────────
 SCAN_INTERVAL   = _int("SCAN_INTERVAL", 180)
-# TOP_N_SYMBOLS=0 → TODAS las monedas de BingX
-TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 0)
+TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 0)        # 0 → TODAS las monedas
 BLACKLIST       = set(_list("BLACKLIST", ""))
 MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 0.0)  # 0 = sin filtro
 
@@ -92,9 +91,21 @@ CB_ENABLED  = _bool("CB_ENABLED", True)
 CB_ATR_MULT = _float("CB_ATR_MULT", 3.0)
 CB_BARS     = _int("CB_BARS", 10)
 
-# ── Gestión de posiciones / cierre ───────────────────
-POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)  # segundos
-BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.0)    # mover SL a BE tras 1 ATR
+# ── Gestión de posiciones / cierre ────────────────────
+POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)   # segundos entre checks
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.0)     # mover SL a BE tras N×ATR
+
+# ── [TRAIL] Trailing Stop ─────────────────────────────
+# Distancia del trailing SL respecto al mejor precio alcanzado (en múltiplos de ATR).
+# Ej: TRAIL_ATR_MULT=1.5 → SL se coloca 1.5×ATR por detrás del máximo/mínimo.
+# Solo actúa DESPUÉS de que el breakeven haya sido activado.
+# Poner 0 para desactivar trailing completamente.
+TRAIL_ATR_MULT = _float("TRAIL_ATR_MULT", 2.0)
+
+# ── [HOLD] Tiempo máximo por trade ───────────────────
+# Minutos máximos que un trade puede estar abierto antes de cerrarse forzosamente.
+# 0 = sin límite de tiempo (comportamiento original).
+MAX_HOLD_MINUTES = _int("MAX_HOLD_MINUTES", 0)
 
 # ── Port ──────────────────────────────────────────────
 PORT = _int("PORT", 8080)
