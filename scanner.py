@@ -1,8 +1,9 @@
 """
 QF×JP Bot v6.3.1 — Scanner
-FIX TELEGRAM: en LIVE mode NO se llama notify_signal antes de abrir.
-  Solo se notifica con notify_trade_opened tras apertura exitosa.
-  Esto evita el ban 429 por spam (17+ señales × cada 60s).
+FIX BALANCE: get_balance() se llama UNA vez por iteración, no 549 veces.
+  Antes: 549 llamadas API/ciclo → rate limit → balance=0 → qty=0 → skip
+  Ahora: 1 llamada/ciclo → balance correcto → trades abren
+FIX TELEGRAM: notify_signal eliminado en LIVE mode → sin spam 429
 """
 import asyncio
 import logging
@@ -45,6 +46,7 @@ async def _process_symbol(
     client: BingXClient,
     risk: RiskManager,
     pos_mgr: PositionManager,
+    balance: float,
 ) -> Optional[Signal]:
 
     if pos_mgr.is_trading(symbol):
@@ -82,30 +84,26 @@ async def _process_symbol(
 
     log.info("[%s] Señal %s tier=%s score=%.1f", symbol, sig.direction, sig.tier, sig.score)
 
-    # ── SIGNAL mode: notificar y salir ───────────────────────────────────────
+    # SIGNAL mode
     if C.MODE == "SIGNAL":
         await tg.notify_signal(sig)
         return sig
 
-    # ── LIVE mode ─────────────────────────────────────────────────────────────
+    # LIVE mode
     can, reason = await risk.can_trade()
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
 
-    try:
-        balance = await client.get_balance()
-    except Exception as e:
-        log.error("[%s] get_balance error: %s", symbol, e)
+    if balance <= 0:
+        log.warning("[%s] balance=0 → skip", symbol)
         return None
 
     qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
     if qty <= 0:
-        log.warning("[%s] qty=0, skip", symbol)
+        log.warning("[%s] qty=0 (bal=%.4f entry=%.6f sl=%.6f) → skip",
+                    symbol, balance, sig.entry, sig.sl)
         return None
-
-    # ── NO notify_signal aquí — evita spam Telegram ───────────────────────────
-    # Solo se notifica si el trade abre con éxito (notify_trade_opened abajo)
 
     try:
         results = await client.open_trade(
@@ -124,7 +122,6 @@ async def _process_symbol(
     entry_resp = results.get("entry", {})
     if entry_resp.get("code", -1) != 0:
         log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
-        # NO notificar entradas rechazadas — evita spam de errores
         return None
 
     order_id = str(
@@ -144,10 +141,7 @@ async def _process_symbol(
         order_id=order_id,
     )
     await pos_mgr.register_trade(trade)
-
-    # ── Notificar SOLO tras apertura exitosa ──────────────────────────────────
     await tg.notify_trade_opened(sig, qty, order_id)
-
     return sig
 
 
@@ -160,16 +154,25 @@ async def scan_loop(
              C.MODE, C.SCAN_INTERVAL,
              C.TOP_N_SYMBOLS if C.TOP_N_SYMBOLS > 0 else "TODAS")
 
-    try:
-        balance = await client.get_balance()
-    except Exception:
-        balance = 0.0
-    symbols = []
+    symbols   = []
     iteration = 0
 
     while True:
         start = time.time()
         iteration += 1
+
+        # Balance UNA vez por ciclo (no por símbolo)
+        try:
+            balance = await client.get_balance()
+            if balance <= 0:
+                log.warning("Balance=0 iter %d — reintentando", iteration)
+                await asyncio.sleep(5)
+                balance = await client.get_balance()
+        except Exception as e:
+            log.error("get_balance error iter %d: %s", iteration, e)
+            balance = 0.0
+
+        log.info("Balance activo: %.4f USDT", balance)
 
         # Refrescar símbolos cada 10 iteraciones
         if iteration == 1 or iteration % 10 == 0 or not symbols:
@@ -179,7 +182,7 @@ async def scan_loop(
                     symbols = new_symbols
                     log.info("Símbolos activos: %d", len(symbols))
                 else:
-                    log.warning("get_all_symbols devolvió lista vacía (iter=%d)", iteration)
+                    log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:
                 log.error("get_all_symbols error: %s", e)
                 if not symbols:
@@ -190,22 +193,25 @@ async def scan_loop(
             await asyncio.sleep(10)
             continue
 
-        # Status periódico — cada 20 iteraciones (no cada iteración)
+        # Status Telegram cada 20 iteraciones
         if iteration % 20 == 0:
             try:
-                balance = await client.get_balance()
                 await tg.notify_status(risk.status(), balance, len(symbols))
             except Exception as e:
                 log.warning("status notify error: %s", e)
 
-        BATCH_SIZE   = 10
+        # Procesar en batches con balance compartido
+        BATCH_SIZE    = 10
         signals_found = 0
 
         for i in range(0, len(symbols), BATCH_SIZE):
             batch   = symbols[i: i + BATCH_SIZE]
-            tasks   = [_process_symbol(sym, client, risk, pos_mgr) for sym in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
+            tasks   = [
+                _process_symbol(sym, client, risk, pos_mgr, balance)
+                for sym in batch
+            ]
+            res = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in res:
                 if isinstance(r, Signal) and r.direction != "NONE":
                     signals_found += 1
             await asyncio.sleep(0.5)
