@@ -1,8 +1,7 @@
 """
-QF×JP Bot v6.3.1 — BingX Client
-FIX FIRMA:   sorted(params) + &timestamp al final = protocolo oficial BingX parseParam
-FIX 109400:  volumePrecision cacheado → qty redondeada correctamente
-FIX TIMING:  timestamp fresco en cada reintento de retry
+QF×JP Bot v6.3.2 — BingX Client
+FIRMA: parseParam oficial BingX
+  sorted(params) + &timestamp=xxx al final → HMAC → &signature=xxx
 """
 import hmac
 import hashlib
@@ -14,51 +13,57 @@ from urllib.parse import urlencode
 from typing import Optional
 
 import aiohttp
-
 import config as C
 
 log = logging.getLogger("bingx")
 
-# ── Helpers de firma ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FIRMA — protocolo oficial BingX (función parseParam)
+# Ref: https://bingx-api.github.io/docs/#/swapV2/authentication.html
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(payload: str) -> str:
-    """HMAC-SHA256 del payload string."""
-    return hmac.new(
+def _build_signed_qs(params: dict) -> str:
+    """
+    Construye el query string firmado exactamente como parseParam oficial:
+
+        sorted_params_string + &timestamp=xxx + &signature=HMAC(todo_eso)
+
+    Pasos:
+      1. sorted(params.keys()) — sin timestamp
+      2. "key=val&key=val" — concatenación simple (NO urlencode)
+      3. "&timestamp=xxx"  — siempre al final del payload firmado
+      4. HMAC-SHA256 del payload completo
+      5. "&signature=xxx"  — appended a la URL
+    """
+    sorted_keys = sorted(params.keys())
+    parts       = ["%s=%s" % (k, params[k]) for k in sorted_keys]
+    base        = "&".join(parts)
+    ts          = _ts()
+    payload     = (base + "&timestamp=" + ts) if base else ("timestamp=" + ts)
+    signature   = hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
         payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+    result = payload + "&signature=" + signature
+    log.debug("FIRMA payload=%s sig=%s...", payload[:80], signature[:12])
+    return result
 
-def _signed_query(params: dict) -> str:
-    """
-    Protocolo EXACTO de BingX (función parseParam oficial):
-      1. Ordenar las claves alfabéticamente (sin timestamp)
-      2. Serializar: key=val&key=val  (formato simple, no urlencode)
-      3. Añadir &timestamp=xxx al final
-      4. Firmar ese string completo con HMAC-SHA256
-      5. Devolver payload + &signature=xxx
-    Ref: https://bingx-api.github.io/docs/#/swapV2/authentication.html
-    """
-    sorted_keys = sorted(params.keys())
-    parts = [f"{k}={params[k]}" for k in sorted_keys]
-    base = "&".join(parts)
-    ts = _ts()
-    payload = f"{base}&timestamp={ts}" if base else f"timestamp={ts}"
-    return f"{payload}&signature={_sign(payload)}"
-
-# ── Cliente base ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Cliente HTTP
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BingXClient:
     BASE = C.BINGX_BASE_URL
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        # Caché de precisión por símbolo (fix error 109400)
-        self._precision_map: dict[str, int]   = {}   # symbol → decimal places
-        self._min_qty_map:   dict[str, float] = {}   # symbol → qty mínima
+        self._precision_map: dict[str, int]   = {}
+        self._min_qty_map:   dict[str, float] = {}
+        log.info("BingXClient v6.3.2 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -78,11 +83,12 @@ class BingXClient:
         for attempt in range(3):
             try:
                 if signed:
-                    url = f"{self.BASE}{path}?{_signed_query(base)}"
+                    qs  = _build_signed_qs(base)
+                    url = "%s%s?%s" % (self.BASE, path, qs)
                 elif base:
-                    url = f"{self.BASE}{path}?{urlencode(base)}"
+                    url = "%s%s?%s" % (self.BASE, path, urlencode(base))
                 else:
-                    url = f"{self.BASE}{path}"
+                    url = "%s%s" % (self.BASE, path)
                 async with session.get(url) as r:
                     return await r.json(content_type=None)
             except Exception as e:
@@ -96,8 +102,8 @@ class BingXClient:
         session = await self._get_session()
         for attempt in range(3):
             try:
-                # Params van en query string; body vacío — protocolo oficial BingX
-                url = f"{self.BASE}{path}?{_signed_query(params)}"
+                qs  = _build_signed_qs(params)
+                url = "%s%s?%s" % (self.BASE, path, qs)
                 async with session.post(url) as r:
                     return await r.json(content_type=None)
             except Exception as e:
@@ -111,7 +117,8 @@ class BingXClient:
         session = await self._get_session()
         for attempt in range(3):
             try:
-                url = f"{self.BASE}{path}?{_signed_query(params)}"
+                qs  = _build_signed_qs(params)
+                url = "%s%s?%s" % (self.BASE, path, qs)
                 async with session.delete(url) as r:
                     return await r.json(content_type=None)
             except Exception as e:
@@ -124,7 +131,6 @@ class BingXClient:
     # ── Redondeo de cantidad ──────────────────────────────────────────────────
 
     def _round_qty(self, symbol: str, qty: float) -> float:
-        """Floor al lot size del símbolo — nunca excede el capital."""
         precision = self._precision_map.get(symbol, 6)
         if precision == 0:
             return float(math.floor(qty))
@@ -135,13 +141,9 @@ class BingXClient:
         min_q = self._min_qty_map.get(symbol, 0.0)
         return qty >= min_q if min_q > 0 else True
 
-    # ── Mercado ───────────────────────────────────────────────────────────────
+    # ── Símbolos ──────────────────────────────────────────────────────────────
 
     async def get_all_symbols(self) -> list[str]:
-        """
-        Usa /contracts para cachear precisión y filtro de volumen.
-        Fallback a /ticker si contracts no trae volumen.
-        """
         data = await self._get("/openApi/swap/v2/quote/contracts")
         raw  = data.get("data", [])
         if isinstance(raw, dict):
@@ -159,18 +161,16 @@ class BingXClient:
             sym = item.get("symbol", "")
             if not sym:
                 continue
-            # Normalizar
             if "-" not in sym and sym.endswith("USDT"):
                 sym = sym[:-4] + "-USDT"
             if not sym.endswith("-USDT"):
                 continue
             if sym in C.BLACKLIST:
                 continue
-            base = sym.replace("-USDT", "")
-            if any(base.startswith(p) for p in ("BEAR", "BULL", "PUMP", "NCS")):
+            base_coin = sym.replace("-USDT", "")
+            if any(base_coin.startswith(p) for p in ("BEAR", "BULL", "PUMP", "NCS")):
                 continue
 
-            # Cachear precisión y qty mínima (fix 109400)
             self._precision_map[sym] = int(item.get("volumePrecision", 6) or 6)
             self._min_qty_map[sym]   = float(item.get("tradeMinQuantity", 0) or 0)
 
@@ -185,7 +185,7 @@ class BingXClient:
             vol_map[sym] = vol
             symbols.append(sym)
 
-        # Si /contracts no trae volumen, usar /ticker para filtrarlo
+        # Enriquecer volumen desde /ticker si contracts no lo tiene
         if vol_detected == 0 and symbols:
             log.info("contracts sin volumen → enriqueciendo con /ticker")
             try:
@@ -202,7 +202,6 @@ class BingXClient:
             except Exception as e:
                 log.warning("ticker fallback error: %s", e)
 
-        # Aplicar filtro de volumen (solo si tenemos datos)
         if vol_detected > 0 and C.MIN_VOLUME_USDT > 0:
             symbols = [s for s in symbols if vol_map.get(s, 0) >= C.MIN_VOLUME_USDT]
 
@@ -250,15 +249,12 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        """Retorna availableMargin USDT."""
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
             signed=True,
         )
         raw = data.get("data", {})
-
-        # Formato real: data = [{asset, availableMargin, ...}, ...]
         if isinstance(raw, list):
             for a in raw:
                 if isinstance(a, dict) and a.get("asset", "") == "USDT":
@@ -268,7 +264,6 @@ class BingXClient:
                 if v is not None:
                     return float(v or 0)
             return 0.0
-
         if isinstance(raw, dict):
             bal = raw.get("balance", raw)
             if isinstance(bal, list):
@@ -277,7 +272,6 @@ class BingXClient:
                         return float(a.get("availableMargin", 0) or 0)
             if isinstance(bal, dict):
                 return float(bal.get("availableMargin", 0) or 0)
-
         log.warning("get_balance: formato inesperado %s", str(data)[:200])
         return 0.0
 
@@ -313,11 +307,7 @@ class BingXClient:
     # ── Órdenes ───────────────────────────────────────────────────────────────
 
     async def place_market_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        position_side: str = "LONG",
+        self, symbol: str, side: str, quantity: float, position_side: str = "LONG",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
         if not self._check_min_qty(symbol, qty):
@@ -334,13 +324,8 @@ class BingXClient:
         return await self._post("/openApi/swap/v2/trade/order", params)
 
     async def place_stop_market_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        stop_price: float,
-        position_side: str = "LONG",
-        close_position: bool = True,
+        self, symbol: str, side: str, quantity: float, stop_price: float,
+        position_side: str = "LONG", close_position: bool = True,
         order_type: str = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
@@ -370,32 +355,23 @@ class BingXClient:
         )
 
     async def close_position_market(
-        self,
-        symbol: str,
-        quantity: float,
-        position_side: str,
+        self, symbol: str, quantity: float, position_side: str,
     ) -> dict:
         side = "SELL" if position_side == "LONG" else "BUY"
         qty  = self._round_qty(symbol, quantity)
-        params = {
+        return await self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         side,
             "positionSide": position_side,
             "type":         "MARKET",
             "quantity":     str(qty),
-        }
-        return await self._post("/openApi/swap/v2/trade/order", params)
+        })
 
     # ── open_trade completo ───────────────────────────────────────────────────
 
     async def open_trade(
-        self,
-        symbol: str,
-        direction: str,
-        quantity: float,
-        sl_price: float,
-        tp1_price: float,
-        tp2_price: float,
+        self, symbol: str, direction: str, quantity: float,
+        sl_price: float, tp1_price: float, tp2_price: float,
     ) -> dict:
         side_entry = "BUY"  if direction == "LONG" else "SELL"
         side_close = "SELL" if direction == "LONG" else "BUY"
@@ -405,7 +381,7 @@ class BingXClient:
 
         qty = self._round_qty(symbol, quantity)
         if not self._check_min_qty(symbol, qty):
-            log.warning("[%s] qty %.6f < min → skip trade", symbol, qty)
+            log.warning("[%s] qty %.6f < min → skip", symbol, qty)
             return {"entry": {"code": -1, "msg": "qty_below_minimum"}}
 
         entry_resp = await self.place_market_order(symbol, side_entry, qty, direction)
@@ -420,7 +396,6 @@ class BingXClient:
             symbol, side_close, qty, sl_price, direction,
             close_position=True, order_type="STOP_MARKET",
         )
-
         qty_half = self._round_qty(symbol, qty / 2)
         results["tp1"] = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
