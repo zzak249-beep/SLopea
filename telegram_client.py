@@ -1,6 +1,8 @@
 """
 QF×JP Bot v6.3 — Telegram Client
 Notificaciones: señal, apertura trade, cierre trade, errores, status.
+
+FIX v6.3.5: notify_blocked() — avisa cuando risk manager rechaza una señal.
 """
 import asyncio
 import logging
@@ -54,7 +56,7 @@ def _score_bar(score: float) -> str:
 
 
 async def notify_signal(sig) -> bool:
-    """Notificación de señal (MODE=SIGNAL o antes de abrir trade)."""
+    """Notificación de señal (siempre — independiente de si se abre trade)."""
     dir_e  = _dir_emoji(sig.direction)
     tier_e = _tier_emoji(sig.tier)
     vdi_sign = "🟢 BULL" if sig.vdi > 0 else "🔴 BEAR"
@@ -84,6 +86,21 @@ async def notify_signal(sig) -> bool:
         f"<b>Momentum:</b>   {sig.momentum:+.3f}\n"
         f"{'━' * 22}\n"
         f"<i>Mode: {C.MODE}</i>"
+    )
+    return await _send(msg)
+
+
+async def notify_blocked(sig, reason: str) -> bool:
+    """Señal encontrada pero bloqueada por risk manager."""
+    dir_e  = _dir_emoji(sig.direction)
+    tier_e = _tier_emoji(sig.tier)
+    msg = (
+        f"🚫 <b>SEÑAL BLOQUEADA — QF×JP v6.3</b>\n"
+        f"{'━' * 22}\n"
+        f"<b>Par:</b>    {sig.symbol}\n"
+        f"<b>Dir:</b>    {dir_e} {sig.direction}\n"
+        f"<b>Tier:</b>   {tier_e} {sig.tier}  Score: {sig.score}/100\n"
+        f"<b>Razón:</b>  <code>{reason}</code>"
     )
     return await _send(msg)
 
