@@ -12,6 +12,9 @@ FIX v6.3.2: Balance se obtiene UNA vez por iteración
 FIX v6.3.4: Notional check en scanner antes de open_trade.
   Consulta ticker para obtener mark_price real y calcular
   notional = qty × price. Aborta si < 5 USDT o > 500 USDT.
+FIX v6.3.5: notify_signal movido ANTES de risk checks → Telegram
+  siempre recibe señales aunque no se abra trade.
+  notify_blocked() cuando risk.can_trade() rechaza.
 """
 import asyncio
 import logging
@@ -98,14 +101,20 @@ async def _process_symbol(
 
     log.info("[%s] Señal %s tier=%s score=%.1f", symbol, sig.direction, sig.tier, sig.score)
 
+    # ── FIX v6.3.5: Notificar señal SIEMPRE (antes de cualquier filtro de trade) ──
+    # En SIGNAL mode: notificar y salir.
+    # En LIVE mode: notificar igualmente — así Telegram siempre recibe la señal
+    # aunque el risk manager decida no abrir el trade.
+    await tg.notify_signal(sig)
+
     if C.MODE == "SIGNAL":
-        await tg.notify_signal(sig)
         return sig
 
     # ── LIVE mode ─────────────────────────────────────────────────────────────
     can, reason = await risk.can_trade()
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
+        await tg.notify_blocked(sig, reason)
         return None
 
     # ── Obtener mark_price real para validación de notional ──────────────────
@@ -141,8 +150,6 @@ async def _process_symbol(
 
     log.info("[%s] qty=%.6f notional=%.2f USDT (price=%.6f)",
              symbol, qty, notional, mark_price)
-
-    await tg.notify_signal(sig)
 
     try:
         results = await client.open_trade(
