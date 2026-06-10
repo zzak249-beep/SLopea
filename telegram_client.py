@@ -1,7 +1,8 @@
 """
-QF×JP Bot v6.3.1 — Telegram Client
-Rate limiter: máx 1 mensaje cada 3s, cola interna de 20, dedup 60s.
-Evita el ban 429 que ocurre cuando el bot envía decenas de mensajes/min.
+QF×JP Bot v6.3 — Telegram Client
+Notificaciones: señal, apertura trade, cierre trade, errores, status.
+
+FIX v6.3.5: notify_blocked() — avisa cuando risk manager rechaza una señal.
 """
 import asyncio
 import logging
@@ -13,165 +14,200 @@ import aiohttp
 import config as C
 
 log = logging.getLogger("telegram")
-_BASE = "https://api.telegram.org"
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
-_lock       = asyncio.Lock()
-_last_sent  = 0.0          # timestamp del último envío exitoso
-_MIN_GAP    = 3.0          # segundos mínimos entre mensajes
-_sent_cache: dict[str, float] = {}  # hash → timestamp para dedup
-_DEDUP_TTL  = 60.0         # segundos antes de permitir el mismo msg
+BASE_URL = f"https://api.telegram.org/bot{C.TELEGRAM_TOKEN}"
 
-def _should_skip(text: str) -> bool:
-    """Devuelve True si el mismo mensaje fue enviado hace menos de DEDUP_TTL seg."""
-    key = text[:80]  # primeros 80 chars como clave
-    now = time.time()
-    last = _sent_cache.get(key, 0.0)
-    if now - last < _DEDUP_TTL:
-        return True
-    _sent_cache[key] = now
-    # Limpiar entradas viejas
-    old = [k for k, v in _sent_cache.items() if now - v > _DEDUP_TTL * 2]
-    for k in old:
-        del _sent_cache[k]
-    return False
+# Rate limiting: mínimo 1.5s entre mensajes para no saturar la API
+_last_send: float = 0.0
+_SEND_INTERVAL = 1.5  # segundos mínimos entre mensajes
 
-def _esc(text: str) -> str:
-    return (str(text)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;"))
 
-# ── Envío base ────────────────────────────────────────────────────────────────
+async def _send(text: str, parse_mode: str = "HTML") -> bool:
+    global _last_send
 
-async def send_message(text: str) -> bool:
-    """Envía mensaje HTML con rate limiting. Silencioso si no hay token."""
     if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
+        log.debug("Telegram no configurado")
         return False
 
-    global _last_sent
+    # Rate limiting local
+    now = time.time()
+    gap = _last_send + _SEND_INTERVAL - now
+    if gap > 0:
+        await asyncio.sleep(gap)
 
-    async with _lock:
-        # Throttle: respetar gap mínimo entre mensajes
-        now   = time.time()
-        gap   = now - _last_sent
-        if gap < _MIN_GAP:
-            await asyncio.sleep(_MIN_GAP - gap)
-
-        # Dedup: no enviar el mismo mensaje dos veces en 60s
-        if _should_skip(text):
-            return True
-
-        url     = f"{_BASE}/bot{C.TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id":                  C.TELEGRAM_CHAT_ID,
-            "text":                     text,
-            "parse_mode":               "HTML",
-            "disable_web_page_preview": True,
-        }
-
-        for attempt in range(2):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url, json=payload,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as r:
-                        if r.status == 200:
-                            _last_sent = time.time()
-                            return True
-                        body = await r.text()
-                        # 429 = rate limit → esperar retry_after
-                        if r.status == 429:
-                            import json as _json
-                            try:
-                                data       = _json.loads(body)
-                                retry_after = int(data.get("parameters", {}).get("retry_after", 30))
-                                log.warning("Telegram 429 — esperando %ds", retry_after)
-                                # No esperar retry_after completo (puede ser 12h)
-                                # Solo logear y salir
-                            except Exception:
-                                pass
-                            return False
-                        if r.status == 400:
-                            log.warning("Telegram 400 (msg mal formado): %s", body[:100])
-                            return False
-                        log.warning("Telegram %d: %s", r.status, body[:100])
-            except Exception as e:
-                log.warning("send_message attempt %d error: %s", attempt + 1, e)
-            if attempt == 0:
-                await asyncio.sleep(2)
-
+    payload = {
+        "chat_id": C.TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{BASE_URL}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    _last_send = time.time()
+                    if r.status == 429:
+                        # Rate limit de Telegram — loggear y abandonar (no bloquear horas)
+                        try:
+                            body = await r.json()
+                            retry = body.get("parameters", {}).get("retry_after", 0)
+                        except Exception:
+                            retry = 0
+                        log.warning("Telegram 429 — rate limit, skip (retry_after=%ds)", retry)
+                        return False
+                    data = await r.json()
+                    if data.get("ok"):
+                        return True
+                    log.warning("Telegram error: %s", data)
+                    return False
+        except Exception as e:
+            if attempt == 1:
+                log.error("Telegram fallo: %s", e)
+                return False
+            await asyncio.sleep(2)
     return False
 
-# ── Notificaciones específicas ────────────────────────────────────────────────
 
-async def notify_signal(sig) -> None:
-    """Solo en SIGNAL mode — en LIVE no llamar (usar notify_trade_opened)."""
-    tier_emoji = {"STD": "⚪", "FUEL": "🟡", "SUP": "🔵"}.get(sig.tier, "⚪")
-    dir_str    = "LONG" if sig.direction == "LONG" else "SHORT"
-    text = (
-        f"{tier_emoji} <b>{dir_str} {sig.tier}</b> — {_esc(sig.symbol)}\n"
-        f"Score: <b>{sig.score:.0f}</b> | Entry: <code>{sig.entry:.6f}</code>\n"
-        f"SL: <code>{sig.sl:.6f}</code> | TP1: <code>{sig.tp1:.6f}</code>"
+def _tier_emoji(tier: str) -> str:
+    return {"STD": "⚪", "FUEL": "🔥", "SUP": "💎"}.get(tier, "⚪")
+
+def _dir_emoji(direction: str) -> str:
+    return "🟢" if direction == "LONG" else "🔴"
+
+def _score_bar(score: float) -> str:
+    filled = int(score / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+async def notify_signal(sig) -> bool:
+    """Notificación de señal (siempre — independiente de si se abre trade)."""
+    dir_e  = _dir_emoji(sig.direction)
+    tier_e = _tier_emoji(sig.tier)
+    vdi_sign = "🟢 BULL" if sig.vdi > 0 else "🔴 BEAR"
+    htf_pct  = f"{sig.htf_score * 100:.0f}%"
+
+    msg = (
+        f"📡 <b>SEÑAL — QF×JP v6.3</b>\n"
+        f"{'━' * 22}\n"
+        f"<b>Par:</b>       {sig.symbol}\n"
+        f"<b>Dir:</b>       {dir_e} {sig.direction}\n"
+        f"<b>Tier:</b>      {tier_e} {sig.tier}\n"
+        f"<b>Score:</b>     {sig.score}/100  {_score_bar(sig.score)}\n"
+        f"{'━' * 22}\n"
+        f"<b>Entry:</b>     {sig.entry:.6f}\n"
+        f"<b>SL:</b>        {sig.sl:.6f}\n"
+        f"<b>TP1 (50%):</b> {sig.tp1:.6f}\n"
+        f"<b>TP2 (50%):</b> {sig.tp2:.6f}\n"
+        f"<b>ATR:</b>       {sig.atr:.6f}\n"
+        f"{'━' * 22}\n"
+        f"<b>TL Ruptura:</b>  {sig.tl_break} {'🔥' if sig.tl_break_active else ''}\n"
+        f"<b>Estructura:</b>  {sig.structure}\n"
+        f"<b>ADX:</b>        {sig.adx:.1f}\n"
+        f"<b>MFI:</b>        {sig.mfi:.1f}\n"
+        f"<b>VDI:</b>        {vdi_sign} ({sig.vdi:+.2f}σ)\n"
+        f"<b>HTF Score:</b>  {htf_pct}\n"
+        f"<b>CVD:</b>        {sig.cvd:+.3f}\n"
+        f"<b>Momentum:</b>   {sig.momentum:+.3f}\n"
+        f"{'━' * 22}\n"
+        f"<i>Mode: {C.MODE}</i>"
     )
-    await send_message(text)
+    return await _send(msg)
 
 
-async def notify_trade_opened(sig, qty: float, order_id: str) -> None:
-    dir_str   = "🟢 LONG" if sig.direction == "LONG" else "🔴 SHORT"
-    sl_pct    = abs(sig.entry - sig.sl) / sig.entry * 100 * C.LEVERAGE
-    text = (
-        f"✅ <b>TRADE ABIERTO — {dir_str}</b>\n"
-        f"📌 <b>{_esc(sig.symbol)}</b> | {sig.tier} | Score {sig.score:.0f}\n"
-        f"Entry: <code>{sig.entry:.6f}</code> | Qty: <code>{qty:.4f}</code>\n"
-        f"SL: <code>{sig.sl:.6f}</code> ({sl_pct:.1f}% riesgo)\n"
-        f"TP1: <code>{sig.tp1:.6f}</code> | TP2: <code>{sig.tp2:.6f}</code>"
+async def notify_blocked(sig, reason: str) -> bool:
+    """Señal encontrada pero bloqueada por risk manager."""
+    dir_e  = _dir_emoji(sig.direction)
+    tier_e = _tier_emoji(sig.tier)
+    msg = (
+        f"🚫 <b>SEÑAL BLOQUEADA — QF×JP v6.3</b>\n"
+        f"{'━' * 22}\n"
+        f"<b>Par:</b>    {sig.symbol}\n"
+        f"<b>Dir:</b>    {dir_e} {sig.direction}\n"
+        f"<b>Tier:</b>   {tier_e} {sig.tier}  Score: {sig.score}/100\n"
+        f"<b>Razón:</b>  <code>{reason}</code>"
     )
-    await send_message(text)
+    return await _send(msg)
+
+
+async def notify_trade_opened(sig, qty: float, order_id: str) -> bool:
+    dir_e  = _dir_emoji(sig.direction)
+    tier_e = _tier_emoji(sig.tier)
+    msg = (
+        f"✅ <b>TRADE ABIERTO — QF×JP v6.3</b>\n"
+        f"{'━' * 22}\n"
+        f"<b>Par:</b>     {sig.symbol}\n"
+        f"<b>Dir:</b>     {dir_e} {sig.direction}\n"
+        f"<b>Tier:</b>    {tier_e} {sig.tier}  Score: {sig.score}/100\n"
+        f"<b>Qty:</b>     {qty}\n"
+        f"{'━' * 22}\n"
+        f"<b>Entry:</b>   {sig.entry:.6f}\n"
+        f"<b>SL:</b>      {sig.sl:.6f}  (-{abs(sig.entry - sig.sl):.6f})\n"
+        f"<b>TP1:</b>     {sig.tp1:.6f}\n"
+        f"<b>TP2:</b>     {sig.tp2:.6f}\n"
+        f"{'━' * 22}\n"
+        f"<b>OrderID:</b> <code>{order_id}</code>"
+    )
+    return await _send(msg)
 
 
 async def notify_trade_closed(
-    symbol: str, direction: str, entry: float, close_price: float,
-    qty: float, reason: str, pnl: float,
-) -> None:
-    reason_map = {
-        "sl_tp_auto":    "🏁 SL/TP auto",
-        "tp1_partial":   "🎯 TP1 50%",
-        "max_hold_time": "⏱ Tiempo máximo",
-        "manual_close":  "🖐 Manual",
-        "emergency":     "🚨 Emergencia",
-    }
-    r_str    = reason_map.get(reason, reason)
-    pnl_icon = "✅" if pnl >= 0 else "❌"
-    text = (
-        f"{pnl_icon} <b>CERRADO {direction}</b> — {_esc(symbol)}\n"
-        f"{r_str} | Entry: <code>{entry:.6f}</code> → <code>{close_price:.6f}</code>\n"
-        f"PnL: <b>{'+' if pnl >= 0 else ''}{pnl:.4f} USDT</b>"
+    symbol: str,
+    direction: str,
+    entry: float,
+    close_price: float,
+    qty: float,
+    reason: str,
+    pnl_usdt: float,
+) -> bool:
+    pnl_emoji = "🟢" if pnl_usdt >= 0 else "🔴"
+    sl_dist = abs(entry - close_price)
+    if sl_dist > 0:
+        if direction == "LONG":
+            rr = (close_price - entry) / sl_dist
+        else:
+            rr = (entry - close_price) / sl_dist
+    else:
+        rr = 0.0
+    msg = (
+        f"{pnl_emoji} <b>TRADE CERRADO — QF×JP v6.3</b>\n"
+        f"{'━' * 22}\n"
+        f"<b>Par:</b>     {symbol}\n"
+        f"<b>Dir:</b>     {_dir_emoji(direction)} {direction}\n"
+        f"<b>Razón:</b>   {reason}\n"
+        f"{'━' * 22}\n"
+        f"<b>Entry:</b>   {entry:.6f}\n"
+        f"<b>Cierre:</b>  {close_price:.6f}\n"
+        f"<b>Qty:</b>     {qty}\n"
+        f"<b>PnL:</b>     {pnl_usdt:+.2f} USDT\n"
+        f"<b>R:R:</b>     {rr:.2f}"
     )
-    await send_message(text)
+    return await _send(msg)
 
 
-async def notify_error(context: str, error: str) -> None:
-    text = (
-        f"🚨 <b>ERROR</b> — {_esc(context)}\n"
-        f"<code>{_esc(str(error)[:300])}</code>"
+async def notify_error(context: str, error: str) -> bool:
+    msg = f"⚠️ <b>ERROR</b>\n<b>Contexto:</b> {context}\n<b>Error:</b> <code>{error[:300]}</code>"
+    return await _send(msg)
+
+
+async def notify_status(status: dict, balance: float, n_symbols: int) -> bool:
+    msg = (
+        f"📊 <b>STATUS — QF×JP v6.3</b>\n"
+        f"{'━' * 22}\n"
+        f"<b>Mode:</b>        {C.MODE}\n"
+        f"<b>Balance:</b>     {balance:.2f} USDT\n"
+        f"<b>Símbolos:</b>    {n_symbols}\n"
+        f"<b>Posiciones:</b>  {status['open_positions']}/{status['max_open_trades']}\n"
+        f"<b>Trades hoy:</b>  {status['daily_trades']}/{status['max_daily_trades']}\n"
+        f"<b>PnL hoy:</b>     {status['daily_pnl']:+.2f} USDT\n"
+        f"<b>Límite loss:</b> {status['daily_loss_limit']:.2f} USDT"
     )
-    await send_message(text)
+    return await _send(msg)
 
 
-async def notify_status(risk_status: dict, balance: float, n_symbols: int) -> None:
-    text = (
-        f"📡 <b>STATUS</b> | {_esc(C.MODE)}\n"
-        f"Balance: <code>{balance:.2f} USDT</code>\n"
-        f"Posiciones: <code>{risk_status.get('open_positions',0)}"
-        f"/{risk_status.get('max_open_trades',0)}</code>\n"
-        f"Trades hoy: <code>{risk_status.get('daily_trades',0)}"
-        f"/{risk_status.get('max_daily_trades',0)}</code>\n"
-        f"PnL hoy: <code>{risk_status.get('daily_pnl',0):+.2f} USDT</code>"
-    )
-    await send_message(text)
-
-
-async def notify_circuit_breaker(symbol: str) -> None:
-    await send_message(f"⚡ <b>CIRCUIT BREAKER</b> — {_esc(symbol)}")
+async def notify_circuit_breaker(symbol: str) -> bool:
+    msg = f"⚡ <b>CIRCUIT BREAKER</b> — {symbol}\nVela gigante detectada, skip señal."
+    return await _send(msg)
