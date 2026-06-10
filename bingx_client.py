@@ -1,8 +1,8 @@
 """
 QF×JP Bot v6.3.1 — BingX Client
-FIX FIRMA:   query string manual, signature al final, sin sorted()
+FIX FIRMA:   sorted(params) + &timestamp al final = protocolo oficial BingX parseParam
 FIX 109400:  volumePrecision cacheado → qty redondeada correctamente
-FIX TIMING:  recvWindow=5000 en requests firmados
+FIX TIMING:  timestamp fresco en cada reintento de retry
 """
 import hmac
 import hashlib
@@ -24,30 +24,30 @@ log = logging.getLogger("bingx")
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(query_string: str) -> str:
-    """HMAC-SHA256 del query string ya construido (sin signature)."""
+def _sign(payload: str) -> str:
+    """HMAC-SHA256 del payload string."""
     return hmac.new(
         C.BINGX_SECRET_KEY.encode("utf-8"),
-        query_string.encode("utf-8"),
+        payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
 def _signed_query(params: dict) -> str:
     """
-    Construye el query string firmado según el protocolo BingX:
-      1. Copia los params (sin mutar el original)
-      2. Añade timestamp y recvWindow
-      3. Serializa en orden de inserción (SIN sorted)
-      4. Calcula HMAC sobre ese string
-      5. Añade &signature=xxx AL FINAL
-    El resultado se usa directamente como query string en la URL.
+    Protocolo EXACTO de BingX (función parseParam oficial):
+      1. Ordenar las claves alfabéticamente (sin timestamp)
+      2. Serializar: key=val&key=val  (formato simple, no urlencode)
+      3. Añadir &timestamp=xxx al final
+      4. Firmar ese string completo con HMAC-SHA256
+      5. Devolver payload + &signature=xxx
+    Ref: https://bingx-api.github.io/docs/#/swapV2/authentication.html
     """
-    p = dict(params)
-    p["timestamp"]  = _ts()
-    p["recvWindow"] = "5000"
-    qs  = urlencode(p)          # orden de inserción — NO sorted()
-    sig = _sign(qs)
-    return f"{qs}&signature={sig}"
+    sorted_keys = sorted(params.keys())
+    parts = [f"{k}={params[k]}" for k in sorted_keys]
+    base = "&".join(parts)
+    ts = _ts()
+    payload = f"{base}&timestamp={ts}" if base else f"timestamp={ts}"
+    return f"{payload}&signature={_sign(payload)}"
 
 # ── Cliente base ──────────────────────────────────────────────────────────────
 
