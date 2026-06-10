@@ -3,24 +3,17 @@ QF×JP Bot v6.3 — Risk Manager
 Kelly Criterion, daily limits, position sizing, daily drawdown.
 
 FIX v6.3.1: kelly_position_size usa RISK_PCT como base directa.
-FIX v6.3.4: Añadido cap de notional máximo por trade para evitar
-  qty absurdas en pares de precio micro (W-USDT, LUNC-USDT, etc.)
-  que generaban quantities de millones de tokens → error BingX 109400.
+  Antes: balance × kelly_f × (RISK_PCT/100) → ~0.1 USDT de riesgo (demasiado pequeño)
+  Ahora: balance × (RISK_PCT/100) escalado por Kelly → tamaño proporcional al capital
 """
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 import asyncio
 
 import config as C
 
 log = logging.getLogger("risk")
-
-# ── Notional caps ─────────────────────────────────────────────────────────────
-# BingX mínimo por orden: ~5 USDT notional
-# Cap máximo: evita órdenes gigantes en pares micro-cap
-MIN_NOTIONAL_USDT = 5.0
-MAX_NOTIONAL_USDT = 500.0   # máximo ~500 USDT notional por trade
 
 
 class RiskManager:
@@ -49,7 +42,6 @@ class RiskManager:
         sl: float,
         score: float,
         tier: str,
-        mark_price: Optional[float] = None,
     ) -> float:
         """
         Calcula la cantidad a operar (en moneda base).
@@ -59,9 +51,10 @@ class RiskManager:
           kelly_scale = escala 0.4–1.0 según calidad    ← ajuste por señal
           qty = (risk_usdt × kelly_scale × LEVERAGE) / |entry - sl|
 
-        Caps adicionales:
-          - notional = qty × mark_price debe estar en [MIN_NOTIONAL, MAX_NOTIONAL]
-          - Protege contra pares micro-cap (LUNC, W, PEPE, etc.)
+        Ejemplo con balance=230, RISK_PCT=5, LEVERAGE=5:
+          risk_usdt base = 11.5 USDT
+          kelly_scale ~0.6–1.0 = riesgo real 6.9–11.5 USDT
+          notional = 34–57 USDT por trade
         """
         self._check_reset()
 
@@ -70,7 +63,7 @@ class RiskManager:
 
         risk_per_unit = abs(entry - sl)
         if risk_per_unit < 1e-12:
-            log.warning("SL demasiado cercano a entry para %.8f", entry)
+            log.warning("SL demasiado cercano a entry para %s", entry)
             return 0.0
 
         # ── Kelly como escalador (0.4 – 1.0) ─────────────────────────────────
@@ -86,40 +79,21 @@ class RiskManager:
         kelly_f *= C.KELLY_FRACTION  # fracción de Kelly (default 0.25)
 
         # Normalizar kelly_f en rango 0.4–1.0
+        # kelly_f típico: 0.01–0.12 → mapeamos [0, 0.12] → [0.4, 1.0]
         kelly_scale = 0.4 + 0.6 * min(1.0, kelly_f / 0.10)
 
         # ── Capital arriesgado por trade ──────────────────────────────────────
         risk_usdt = balance * (C.RISK_PCT / 100.0) * kelly_scale
-        # Cap: máximo 8% del capital por trade
+        # Cap: máximo 8% del capital por trade (antes era 3%)
         risk_usdt = min(risk_usdt, balance * 0.08)
 
-        # ── Qty en moneda base (con apalancamiento) ───────────────────────────
+        # ── Qty en moneda base (con apalancamiento) ────────────────────────────
         qty = (risk_usdt * C.LEVERAGE) / risk_per_unit
-
-        # ── Cap de notional MÁXIMO ────────────────────────────────────────────
-        # Usar mark_price si viene del scanner, sino usar entry como aproximación
-        price_ref = mark_price if (mark_price and mark_price > 0) else entry
-        if price_ref > 0:
-            notional = qty * price_ref
-            if notional > MAX_NOTIONAL_USDT:
-                qty_capped = MAX_NOTIONAL_USDT / price_ref
-                log.info(
-                    "[sizing] notional=%.2f USDT > MAX=%.0f → qty %.6f → %.6f",
-                    notional, MAX_NOTIONAL_USDT, qty, qty_capped,
-                )
-                qty = qty_capped
-            elif notional < MIN_NOTIONAL_USDT:
-                log.warning(
-                    "[sizing] notional=%.4f USDT < MIN=%.1f → qty=0 (par demasiado micro)",
-                    notional, MIN_NOTIONAL_USDT,
-                )
-                return 0.0
 
         log.debug(
             "[sizing] balance=%.2f risk_pct=%.1f%% kelly_scale=%.2f "
-            "risk_usdt=%.2f leverage=%dx qty=%.6f notional≈%.2f",
-            balance, C.RISK_PCT, kelly_scale, risk_usdt, C.LEVERAGE,
-            qty, qty * price_ref if price_ref > 0 else 0,
+            "risk_usdt=%.2f leverage=%dx qty=%.6f",
+            balance, C.RISK_PCT, kelly_scale, risk_usdt, C.LEVERAGE, qty,
         )
         return round(qty, 6)
 
