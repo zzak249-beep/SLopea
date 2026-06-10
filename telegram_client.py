@@ -1,8 +1,9 @@
 """
-QF×JP Bot v6.3 — Telegram Client
-Notificaciones: señal, apertura trade, cierre trade, errores, status.
-
-FIX v6.3.5: notify_blocked() — avisa cuando risk manager rechaza una señal.
+QF×JP Bot v6.3.1 — Telegram Client
+Notificaciones asíncronas vía Bot API con HTML parse mode.
+Funciones: send_message, notify_signal, notify_trade_opened,
+           notify_trade_closed, notify_error, notify_status,
+           notify_circuit_breaker
 """
 import asyncio
 import logging
@@ -14,116 +15,87 @@ import config as C
 
 log = logging.getLogger("telegram")
 
-BASE_URL = f"https://api.telegram.org/bot{C.TELEGRAM_TOKEN}"
+_BASE = "https://api.telegram.org"
 
+# ── Envío base ────────────────────────────────────────────────────────────────
 
-async def _send(text: str, parse_mode: str = "HTML") -> bool:
+async def send_message(text: str) -> bool:
+    """Envía un mensaje HTML al chat configurado. Silencia si no hay token."""
     if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
-        log.debug("Telegram no configurado")
         return False
+
+    # Escapar caracteres problemáticos en HTML
+    url     = f"{_BASE}/bot{C.TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": C.TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
+        "chat_id":                  C.TELEGRAM_CHAT_ID,
+        "text":                     text,
+        "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }
+
     for attempt in range(3):
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(f"{BASE_URL}/sendMessage", json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    data = await r.json()
-                    if data.get("ok"):
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    if r.status == 200:
                         return True
-                    log.warning("Telegram error: %s", data)
-                    return False
+                    body = await r.text()
+                    log.warning("Telegram %d: %s", r.status, body[:200])
+                    # 400 = mensaje mal formado → no reintentar
+                    if r.status == 400:
+                        return False
         except Exception as e:
-            if attempt == 2:
-                log.error("Telegram fallo: %s", e)
-                return False
-            await asyncio.sleep(2)
+            log.warning("send_message attempt %d error: %s", attempt + 1, e)
+        await asyncio.sleep(1.5 ** attempt)
     return False
 
 
-def _tier_emoji(tier: str) -> str:
-    return {"STD": "⚪", "FUEL": "🔥", "SUP": "💎"}.get(tier, "⚪")
-
-def _dir_emoji(direction: str) -> str:
-    return "🟢" if direction == "LONG" else "🔴"
-
-def _score_bar(score: float) -> str:
-    filled = int(score / 10)
-    return "█" * filled + "░" * (10 - filled)
+def _esc(text: str) -> str:
+    """Escapa caracteres HTML básicos."""
+    return (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
 
 
-async def notify_signal(sig) -> bool:
-    """Notificación de señal (siempre — independiente de si se abre trade)."""
-    dir_e  = _dir_emoji(sig.direction)
-    tier_e = _tier_emoji(sig.tier)
-    vdi_sign = "🟢 BULL" if sig.vdi > 0 else "🔴 BEAR"
-    htf_pct  = f"{sig.htf_score * 100:.0f}%"
+# ── Notificaciones específicas ────────────────────────────────────────────────
 
-    msg = (
-        f"📡 <b>SEÑAL — QF×JP v6.3</b>\n"
-        f"{'━' * 22}\n"
-        f"<b>Par:</b>       {sig.symbol}\n"
-        f"<b>Dir:</b>       {dir_e} {sig.direction}\n"
-        f"<b>Tier:</b>      {tier_e} {sig.tier}\n"
-        f"<b>Score:</b>     {sig.score}/100  {_score_bar(sig.score)}\n"
-        f"{'━' * 22}\n"
-        f"<b>Entry:</b>     {sig.entry:.6f}\n"
-        f"<b>SL:</b>        {sig.sl:.6f}\n"
-        f"<b>TP1 (50%):</b> {sig.tp1:.6f}\n"
-        f"<b>TP2 (50%):</b> {sig.tp2:.6f}\n"
-        f"<b>ATR:</b>       {sig.atr:.6f}\n"
-        f"{'━' * 22}\n"
-        f"<b>TL Ruptura:</b>  {sig.tl_break} {'🔥' if sig.tl_break_active else ''}\n"
-        f"<b>Estructura:</b>  {sig.structure}\n"
-        f"<b>ADX:</b>        {sig.adx:.1f}\n"
-        f"<b>MFI:</b>        {sig.mfi:.1f}\n"
-        f"<b>VDI:</b>        {vdi_sign} ({sig.vdi:+.2f}σ)\n"
-        f"<b>HTF Score:</b>  {htf_pct}\n"
-        f"<b>CVD:</b>        {sig.cvd:+.3f}\n"
-        f"<b>Momentum:</b>   {sig.momentum:+.3f}\n"
-        f"{'━' * 22}\n"
-        f"<i>Mode: {C.MODE}</i>"
+async def notify_signal(sig) -> None:
+    """Señal detectada (SIGNAL o LIVE antes de abrir)."""
+    tier_emoji = {"STD": "⚪", "FUEL": "🟡", "SUP": "🔵"}.get(sig.tier, "⚪")
+    dir_emoji  = "🟢 LONG" if sig.direction == "LONG" else "🔴 SHORT"
+
+    text = (
+        f"{tier_emoji} <b>SEÑAL {sig.tier} — {dir_emoji}</b>\n"
+        f"📌 <b>{_esc(sig.symbol)}</b>\n"
+        f"📊 Score: <b>{sig.score:.1f}</b>\n"
+        f"💲 Entry: <code>{sig.entry:.6f}</code>\n"
+        f"🛡 SL:    <code>{sig.sl:.6f}</code>\n"
+        f"🎯 TP1:   <code>{sig.tp1:.6f}</code>\n"
+        f"🎯 TP2:   <code>{sig.tp2:.6f}</code>"
     )
-    return await _send(msg)
+    await send_message(text)
 
 
-async def notify_blocked(sig, reason: str) -> bool:
-    """Señal encontrada pero bloqueada por risk manager."""
-    dir_e  = _dir_emoji(sig.direction)
-    tier_e = _tier_emoji(sig.tier)
-    msg = (
-        f"🚫 <b>SEÑAL BLOQUEADA — QF×JP v6.3</b>\n"
-        f"{'━' * 22}\n"
-        f"<b>Par:</b>    {sig.symbol}\n"
-        f"<b>Dir:</b>    {dir_e} {sig.direction}\n"
-        f"<b>Tier:</b>   {tier_e} {sig.tier}  Score: {sig.score}/100\n"
-        f"<b>Razón:</b>  <code>{reason}</code>"
+async def notify_trade_opened(sig, qty: float, order_id: str) -> None:
+    """Trade abierto con éxito en BingX."""
+    dir_emoji = "🟢 LONG" if sig.direction == "LONG" else "🔴 SHORT"
+    sl_pct = abs(sig.entry - sig.sl) / sig.entry * 100 * C.LEVERAGE
+
+    text = (
+        f"✅ <b>TRADE ABIERTO — {dir_emoji}</b>\n"
+        f"📌 <b>{_esc(sig.symbol)}</b> | Tier: {sig.tier} | Score: {sig.score:.1f}\n"
+        f"💲 Entry:    <code>{sig.entry:.6f}</code>\n"
+        f"📦 Qty:      <code>{qty:.6f}</code>\n"
+        f"🛡 SL:       <code>{sig.sl:.6f}</code> ({sl_pct:.1f}% riesgo)\n"
+        f"🎯 TP1:      <code>{sig.tp1:.6f}</code>\n"
+        f"🎯 TP2:      <code>{sig.tp2:.6f}</code>\n"
+        f"🆔 Order:    <code>{_esc(order_id)}</code>"
     )
-    return await _send(msg)
-
-
-async def notify_trade_opened(sig, qty: float, order_id: str) -> bool:
-    dir_e  = _dir_emoji(sig.direction)
-    tier_e = _tier_emoji(sig.tier)
-    msg = (
-        f"✅ <b>TRADE ABIERTO — QF×JP v6.3</b>\n"
-        f"{'━' * 22}\n"
-        f"<b>Par:</b>     {sig.symbol}\n"
-        f"<b>Dir:</b>     {dir_e} {sig.direction}\n"
-        f"<b>Tier:</b>    {tier_e} {sig.tier}  Score: {sig.score}/100\n"
-        f"<b>Qty:</b>     {qty}\n"
-        f"{'━' * 22}\n"
-        f"<b>Entry:</b>   {sig.entry:.6f}\n"
-        f"<b>SL:</b>      {sig.sl:.6f}  (-{abs(sig.entry - sig.sl):.6f})\n"
-        f"<b>TP1:</b>     {sig.tp1:.6f}\n"
-        f"<b>TP2:</b>     {sig.tp2:.6f}\n"
-        f"{'━' * 22}\n"
-        f"<b>OrderID:</b> <code>{order_id}</code>"
-    )
-    return await _send(msg)
+    await send_message(text)
 
 
 async def notify_trade_closed(
@@ -133,53 +105,61 @@ async def notify_trade_closed(
     close_price: float,
     qty: float,
     reason: str,
-    pnl_usdt: float,
-) -> bool:
-    pnl_emoji = "🟢" if pnl_usdt >= 0 else "🔴"
-    sl_dist = abs(entry - close_price)
-    if sl_dist > 0:
-        if direction == "LONG":
-            rr = (close_price - entry) / sl_dist
-        else:
-            rr = (entry - close_price) / sl_dist
-    else:
-        rr = 0.0
-    msg = (
-        f"{pnl_emoji} <b>TRADE CERRADO — QF×JP v6.3</b>\n"
-        f"{'━' * 22}\n"
-        f"<b>Par:</b>     {symbol}\n"
-        f"<b>Dir:</b>     {_dir_emoji(direction)} {direction}\n"
-        f"<b>Razón:</b>   {reason}\n"
-        f"{'━' * 22}\n"
-        f"<b>Entry:</b>   {entry:.6f}\n"
-        f"<b>Cierre:</b>  {close_price:.6f}\n"
-        f"<b>Qty:</b>     {qty}\n"
-        f"<b>PnL:</b>     {pnl_usdt:+.2f} USDT\n"
-        f"<b>R:R:</b>     {rr:.2f}"
+    pnl: float,
+) -> None:
+    """Trade cerrado (SL, TP, trailing, emergencia, tiempo)."""
+    reason_map = {
+        "sl_tp_auto":    "🏁 SL/TP automático",
+        "tp1_partial":   "🎯 TP1 parcial (50%)",
+        "max_hold_time": "⏱ Tiempo máximo",
+        "manual_close":  "🖐 Cierre manual",
+        "emergency":     "🚨 Emergencia",
+    }
+    reason_str = reason_map.get(reason, f"📤 {reason}")
+    pnl_emoji  = "✅" if pnl >= 0 else "❌"
+    dir_str    = "LONG" if direction == "LONG" else "SHORT"
+
+    text = (
+        f"{pnl_emoji} <b>TRADE CERRADO — {dir_str}</b>\n"
+        f"📌 <b>{_esc(symbol)}</b>\n"
+        f"📋 Razón:    {reason_str}\n"
+        f"💲 Entry:    <code>{entry:.6f}</code>\n"
+        f"💲 Cierre:   <code>{close_price:.6f}</code>\n"
+        f"📦 Qty:      <code>{qty:.6f}</code>\n"
+        f"💰 PnL:      <b>{'+' if pnl >= 0 else ''}{pnl:.4f} USDT</b>"
     )
-    return await _send(msg)
+    await send_message(text)
 
 
-async def notify_error(context: str, error: str) -> bool:
-    msg = f"⚠️ <b>ERROR</b>\n<b>Contexto:</b> {context}\n<b>Error:</b> <code>{error[:300]}</code>"
-    return await _send(msg)
-
-
-async def notify_status(status: dict, balance: float, n_symbols: int) -> bool:
-    msg = (
-        f"📊 <b>STATUS — QF×JP v6.3</b>\n"
-        f"{'━' * 22}\n"
-        f"<b>Mode:</b>        {C.MODE}\n"
-        f"<b>Balance:</b>     {balance:.2f} USDT\n"
-        f"<b>Símbolos:</b>    {n_symbols}\n"
-        f"<b>Posiciones:</b>  {status['open_positions']}/{status['max_open_trades']}\n"
-        f"<b>Trades hoy:</b>  {status['daily_trades']}/{status['max_daily_trades']}\n"
-        f"<b>PnL hoy:</b>     {status['daily_pnl']:+.2f} USDT\n"
-        f"<b>Límite loss:</b> {status['daily_loss_limit']:.2f} USDT"
+async def notify_error(context: str, error: str) -> None:
+    """Error crítico del bot."""
+    text = (
+        f"🚨 <b>ERROR — {_esc(context)}</b>\n"
+        f"<code>{_esc(error[:400])}</code>"
     )
-    return await _send(msg)
+    await send_message(text)
 
 
-async def notify_circuit_breaker(symbol: str) -> bool:
-    msg = f"⚡ <b>CIRCUIT BREAKER</b> — {symbol}\nVela gigante detectada, skip señal."
-    return await _send(msg)
+async def notify_status(risk_status: dict, balance: float, n_symbols: int) -> None:
+    """Status periódico del bot."""
+    text = (
+        f"📡 <b>STATUS BOT</b>\n"
+        f"💰 Balance:    <code>{balance:.2f} USDT</code>\n"
+        f"📂 Posiciones: <code>{risk_status.get('open_positions', 0)}"
+        f"/{risk_status.get('max_open_trades', 0)}</code>\n"
+        f"📈 Trades hoy: <code>{risk_status.get('daily_trades', 0)}"
+        f"/{risk_status.get('max_daily_trades', 0)}</code>\n"
+        f"💵 PnL hoy:    <code>{risk_status.get('daily_pnl', 0):+.2f} USDT</code>\n"
+        f"🔍 Símbolos:   <code>{n_symbols}</code>\n"
+        f"⚙️ Modo:       <code>{_esc(C.MODE)}</code>"
+    )
+    await send_message(text)
+
+
+async def notify_circuit_breaker(symbol: str) -> None:
+    """Circuit breaker activado por vela gigante."""
+    text = (
+        f"⚡ <b>CIRCUIT BREAKER</b>\n"
+        f"📌 {_esc(symbol)} — pausa {C.CB_BARS} velas por vela gigante"
+    )
+    await send_message(text)
