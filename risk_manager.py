@@ -1,37 +1,26 @@
 """
-QF×JP Bot v6.4 — Risk Manager
-Kelly Criterion, daily limits, position sizing, daily drawdown.
+QF×JP Bot v6.5 — Risk Manager
 
-CAMBIOS v6.4 vs v6.3:
-  [FIX]    kelly_position_size: eliminado × LEVERAGE en qty.
-           En futuros perpetuos riesgo_USD = qty × risk_per_unit — el leverage
-           solo determina el margen requerido (notional/leverage), no el PnL.
-           Antes: qty = (risk_usdt × LEV) / risk_per_unit → notionals 5× inflados
-           Ahora: qty = risk_usdt / risk_per_unit → notionals correctos
+CAMBIOS v6.5 vs v6.4:
+  [FIX]  MIN_SL_PCT guard: descarta señales donde el SL está demasiado
+         cerca del entry (< 0.3% del precio). Evita qty explosiva en
+         micro-caps como SHIB (SL a 1 pip → 210M contratos → 977 USDT).
 
-  [FIX]    Notional clampeado internamente en lugar de rechazado.
-           Antes el scanner hacía skip de TODAS las señales. Ahora la qty se
-           reduce para caber en MAX_NOTIONAL y el trade sí se abre.
+  [FIX]  MAX_NOTIONAL_PER_TRADE ahora tiene default 500 USDT si no está
+         en config.py. Antes getattr devolvía 0 → sin clamp → trades
+         con 600-977 USDT de notional.
 
-  [NEW]    update_balance(balance): recalcula daily_loss_limit con capital real.
-           Antes se usaba C.CAPITAL fijo desde __init__.
+  [FIX]  Clamp de notional usa SIEMPRE el entry de la señal (no mark_price)
+         para garantizar consistencia entre sizing y validación.
 
-  [NEW]    Min notional guard: descarta dust trades < _MIN_NOTIONAL_USDT (5 USDT).
-
-  [NEW]    Kelly p cappado en _MAX_KELLY_P=0.75 (antes podía llegar a 0.9 × tier_mult).
-
-  [NEW]    Score normalizado desde C.MIN_SCORE en lugar de desde 0 → más
-           diferenciación entre señales medias/altas.
-
-  [NEW]    Tier SUPREMA añadido en hierarchy y tier_mult (1.4×).
-
-  [NEW]    notional_ok() helper para validación externa sin duplicar lógica.
-
-  [NEW]    log.info en cada sizing con notional calculado (antes solo DEBUG).
-
-  [NEW]    status() incluye balance_ref para debugging de límites.
-
-  [NEW]    _MAX_RISK_PCT_TRADE reducido de 8% a 6% (más conservador).
+HISTORIAL v6.4:
+  [FIX]  kelly_position_size: eliminado × LEVERAGE en qty.
+  [FIX]  Notional clampeado internamente (no rechaza señal, reduce qty).
+  [NEW]  update_balance(): daily_loss_limit dinámico con capital real.
+  [NEW]  Kelly p cappado en 0.75.
+  [NEW]  Score normalizado desde C.MIN_SCORE.
+  [NEW]  notional_ok() helper para validación externa.
+  [NEW]  Tier SUPREMA añadido.
 """
 
 import logging
@@ -43,13 +32,13 @@ import config as C
 
 log = logging.getLogger("risk")
 
-# ── Constantes internas (ajustables sin tocar config.py) ─────────────────────
-_MAX_KELLY_P        = 0.75   # prob. máxima para Kelly (evita sobreajuste)
-_MAX_RISK_PCT_TRADE = 0.06   # cap de riesgo por trade (6% del balance)
-_MIN_NOTIONAL_USDT  = 5.0    # notional mínimo para abrir trade (descarta dust)
-_KELLY_SCALE_REF    = 0.10   # kelly_f de referencia que mapea a kelly_scale=1.0
+# ── Constantes internas ───────────────────────────────────────────────────────
+_MAX_KELLY_P        = 0.75    # prob. máxima Kelly (evita sobreajuste)
+_MAX_RISK_PCT_TRADE = 0.06    # cap de riesgo por trade (6% del balance)
+_MIN_NOTIONAL_USDT  = 5.0     # notional mínimo — descarta dust trades
+_KELLY_SCALE_REF    = 0.10    # kelly_f que mapea a kelly_scale = 1.0
 
-# Jerarquía de tiers y multiplicadores (compartida entre métodos)
+# Jerarquía de tiers (compartida entre métodos)
 _TIER_HIERARCHY = {"NONE": -1, "STD": 0, "FUEL": 1, "SUP": 2, "SUPREMA": 3}
 _TIER_MULT      = {"STD": 1.0, "FUEL": 1.1, "SUP": 1.25, "SUPREMA": 1.4}
 
@@ -59,8 +48,8 @@ class RiskManager:
         self._today            = date.today()
         self._daily_trades     = 0
         self._daily_pnl        = 0.0
-        self._balance          = max(C.CAPITAL, 1.0)
-        self._daily_loss_limit = self._balance * 0.05   # 5% drawdown diario
+        self._balance          = max(float(C.CAPITAL), 1.0)
+        self._daily_loss_limit = self._balance * 0.05
         self._open_count       = 0
         self._lock             = asyncio.Lock()
 
@@ -72,108 +61,108 @@ class RiskManager:
             self._today        = today
             self._daily_trades = 0
             self._daily_pnl    = 0.0
-            log.info("[risk] Daily stats reset → %s", today)
+            log.info("[risk] Daily reset → %s", today)
 
     # ── Actualizar balance real ───────────────────────────────────────────────
 
     def update_balance(self, balance: float):
-        """
-        Llamar tras cada fetch_balance exitoso.
-        Recalcula daily_loss_limit con el capital real del exchange.
-        """
+        """Llamar tras cada fetch_balance exitoso para loss_limit dinámico."""
         if balance > 0:
             self._balance          = balance
             self._daily_loss_limit = balance * 0.05
-            log.debug(
-                "[risk] balance=%.2f USDT | loss_limit=%.2f USDT (5%%)",
-                balance, self._daily_loss_limit,
-            )
+            log.debug("[risk] balance=%.2f USDT | loss_limit=%.2f USDT",
+                      balance, self._daily_loss_limit)
 
     # ── Kelly sizing ──────────────────────────────────────────────────────────
 
     def kelly_position_size(
         self,
         balance: float,
-        entry: float,
-        sl: float,
-        score: float,
-        tier: str,
+        entry:   float,
+        sl:      float,
+        score:   float,
+        tier:    str,
     ) -> float:
         """
-        Calcula la cantidad a operar (en moneda base).
+        Calcula qty en moneda base para futuros perpetuos.
 
-        FÓRMULA CORRECTA para futuros perpetuos:
-          risk_usdt  = balance × (RISK_PCT/100) × kelly_scale
-          qty        = risk_usdt / |entry - sl|    ← sin × LEVERAGE
-          notional   = qty × entry                 ← clampeado a MAX_NOTIONAL
+        Fórmula:
+          risk_usdt = balance × (RISK_PCT/100) × kelly_scale
+          qty       = risk_usdt / |entry - sl|    ← sin × LEVERAGE
+          notional  = qty × entry                 ← clampeado a MAX_NOTIONAL
 
-        El leverage no interviene en el sizing porque el P&L en perpetuos es:
-          PnL = qty × (exit_price − entry_price)
-        y el riesgo si toca el SL es:
-          loss = qty × |entry − sl| = risk_usdt  ✓
+        El leverage no afecta qty porque en perpetuos:
+          PnL = qty × (exit − entry)   →   riesgo si SL = qty × |entry − sl|
 
-        El leverage solo determina el margen a bloquear: notional / leverage.
+        El leverage solo determina margen = notional / leverage.
 
-        Ejemplo real (balance=500, RISK_PCT=2, entry=5.0 PROM, SL=4.75 → 5% SL):
-          risk_usdt  = 500 × 0.02 × 0.8 = 8.0 USDT
-          qty        = 8.0 / 0.25 = 32 PROM
-          notional   = 32 × 5.0 = 160 USDT  ← pasa MAX_NOTIONAL=500
-          margen req = 160 / 5 (LEV) = 32 USDT (6.4% del balance)
+        Ejemplo (balance=500, RISK_PCT=2, entry=5.0, SL=4.75):
+          risk_usdt = 500 × 0.02 × 0.8 = 8 USDT
+          qty       = 8 / 0.25 = 32 contratos
+          notional  = 32 × 5.0 = 160 USDT ✓
+          margen    = 160 / 5 (LEV) = 32 USDT (6.4% balance)
         """
         self._check_reset()
 
         if balance <= 0 or entry <= 0:
-            log.warning("[sizing] balance o entry inválidos (%.2f / %.8f)", balance, entry)
+            log.warning("[sizing] datos inválidos balance=%.2f entry=%.8f", balance, entry)
             return 0.0
 
         risk_per_unit = abs(entry - sl)
         if risk_per_unit < 1e-12:
-            log.warning("[sizing] SL demasiado cercano a entry=%.8f", entry)
+            log.warning("[sizing] SL=entry (%.8f) → skip", entry)
             return 0.0
 
-        # ── Kelly como escalador de calidad (0.4 – 1.0) ──────────────────────
-        tier_mult  = _TIER_MULT.get(tier, 1.0)
+        # ── Guard: SL mínimo como % del entry (evita qty explosiva micro-caps) ─
+        min_sl_pct        = getattr(C, "MIN_SL_PCT", 0.003)   # default 0.3%
+        min_risk_per_unit = entry * min_sl_pct
+        if risk_per_unit < min_risk_per_unit:
+            actual_pct = 100.0 * risk_per_unit / entry
+            log.warning(
+                "[sizing] SL demasiado apretado %.4f%% < %.1f%% → skip (%s)",
+                actual_pct, min_sl_pct * 100, tier,
+            )
+            return 0.0
 
-        # Normalizar score desde MIN_SCORE para mayor resolución en rango útil
+        # ── Kelly como escalador de calidad 0.4 – 1.0 ────────────────────────
+        tier_mult  = _TIER_MULT.get(tier, 1.0)
         min_score  = getattr(C, "MIN_SCORE", 40)
         score_norm = max(0.0, (score - min_score) / max(1.0, 100.0 - min_score))
-        score_mult = 0.70 + 0.30 * score_norm   # 0.70 (score mínimo) → 1.00 (score=100)
+        score_mult = 0.70 + 0.30 * score_norm   # 0.70 → 1.00
 
         p = min(C.KELLY_WIN_RATE * tier_mult * score_mult, _MAX_KELLY_P)
         q = 1.0 - p
         rr = C.KELLY_RR
 
         kelly_f = max(0.0, (p * rr - q) / rr)
-        kelly_f *= C.KELLY_FRACTION   # fracción conservadora (ej. 0.25)
+        kelly_f *= C.KELLY_FRACTION
 
-        # [0, _KELLY_SCALE_REF] → [0.4, 1.0]
         kelly_scale = 0.4 + 0.6 * min(1.0, kelly_f / _KELLY_SCALE_REF)
 
-        # ── Capital arriesgado por trade ──────────────────────────────────────
+        # ── Capital arriesgado ────────────────────────────────────────────────
         risk_usdt = balance * (C.RISK_PCT / 100.0) * kelly_scale
-        risk_usdt = min(risk_usdt, balance * _MAX_RISK_PCT_TRADE)   # cap 6%
+        risk_usdt = min(risk_usdt, balance * _MAX_RISK_PCT_TRADE)  # cap 6%
 
-        # ── Qty en moneda base (SIN multiplicar por LEVERAGE) ─────────────────
-        qty = risk_usdt / risk_per_unit
+        # ── Qty en moneda base SIN leverage ──────────────────────────────────
+        qty      = risk_usdt / risk_per_unit
         notional = qty * entry
 
-        # ── Guard: notional mínimo (dust trade) ───────────────────────────────
+        # ── Guard mínimo (dust trade) ─────────────────────────────────────────
         if notional < _MIN_NOTIONAL_USDT:
-            log.warning(
-                "[sizing] %s score=%.1f notional=%.4f < min=%.1f → skip (dust)",
-                tier, score, notional, _MIN_NOTIONAL_USDT,
-            )
+            log.warning("[sizing] notional=%.4f < %.1f USDT → skip (dust)",
+                        notional, _MIN_NOTIONAL_USDT)
             return 0.0
 
-        # ── Clampear notional si supera MAX_NOTIONAL ──────────────────────────
-        # En lugar de rechazar la señal, reducimos qty para que caber en el límite.
-        max_notional = getattr(C, "MAX_NOTIONAL_PER_TRADE", 0)
-        if max_notional > 0 and notional > max_notional:
+        # ── Clamp a MAX_NOTIONAL (default 500 si no está en config.py) ───────
+        max_notional = float(getattr(C, "MAX_NOTIONAL_PER_TRADE", 500))
+        if notional > max_notional:
+            qty_orig = qty
             qty      = max_notional / entry
             notional = max_notional
             log.info(
-                "[sizing] %s notional clampeado → %.2f USDT (max=%.0f) qty=%.6f",
-                tier, notional, max_notional, qty,
+                "[sizing] %s notional clampeado %.2f→%.2f USDT "
+                "(qty %.6f→%.6f, entry=%.8f)",
+                tier, qty_orig * entry, notional, qty_orig, qty, entry,
             )
 
         log.info(
@@ -188,17 +177,17 @@ class RiskManager:
 
     def notional_ok(self, qty: float, entry: float) -> tuple[bool, str]:
         """
-        Validación rápida antes de enviar la orden.
-        Devuelve (True, "ok") o (False, motivo_str).
+        Validación final antes de enviar orden.
+        Retorna (True, "ok") o (False, motivo).
         """
         if qty <= 0:
             return False, "qty_zero"
         notional = qty * entry
         if notional < _MIN_NOTIONAL_USDT:
-            return False, f"notional_dust({notional:.4f}<{_MIN_NOTIONAL_USDT})"
-        max_n = getattr(C, "MAX_NOTIONAL_PER_TRADE", 0)
-        if max_n > 0 and notional > max_n:
-            return False, f"notional_exceeded({notional:.2f}>{max_n})"
+            return False, f"dust({notional:.4f}<{_MIN_NOTIONAL_USDT})"
+        max_n = float(getattr(C, "MAX_NOTIONAL_PER_TRADE", 500))
+        if notional > max_n * 1.05:   # 5% tolerancia por diferencia entry/mark_price
+            return False, f"notional({notional:.2f}>{max_n})"
         return True, "ok"
 
     # ── Límites diarios ───────────────────────────────────────────────────────
@@ -212,8 +201,8 @@ class RiskManager:
                 return False, f"max_open({self._open_count}/{C.MAX_OPEN_TRADES})"
             if self._daily_pnl <= -self._daily_loss_limit:
                 return False, (
-                    f"drawdown(pnl={self._daily_pnl:.2f} / "
-                    f"limit={-self._daily_loss_limit:.2f})"
+                    f"drawdown(pnl={self._daily_pnl:.2f}"
+                    f"/limit={-self._daily_loss_limit:.2f})"
                 )
             return True, "ok"
 
@@ -221,15 +210,16 @@ class RiskManager:
         async with self._lock:
             self._daily_trades += 1
             self._open_count   += 1
+            log.info("[risk] trade abierto → daily=%d/%d open=%d/%d",
+                     self._daily_trades, C.MAX_DAILY_TRADES,
+                     self._open_count,   C.MAX_OPEN_TRADES)
 
     async def on_trade_closed(self, pnl: float):
         async with self._lock:
             self._open_count = max(0, self._open_count - 1)
             self._daily_pnl += pnl
-            log.debug(
-                "[risk] trade cerrado pnl=%.4f | daily_pnl=%.4f / limit=%.4f",
-                pnl, self._daily_pnl, -self._daily_loss_limit,
-            )
+            log.info("[risk] trade cerrado pnl=%.4f | daily_pnl=%.4f/%.4f",
+                     pnl, self._daily_pnl, -self._daily_loss_limit)
 
     async def update_open_count(self, n: int):
         async with self._lock:
