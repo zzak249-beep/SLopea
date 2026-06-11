@@ -89,8 +89,11 @@ class BingXClient:
                     url = "%s%s?%s" % (self.BASE, path, urlencode(base))
                 else:
                     url = "%s%s" % (self.BASE, path)
-                async with session.get(url) as r:
-                    return await r.json(content_type=None)
+                async with session.get(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
+                    data = await r.json(content_type=None)
+                    if signed and data.get("code") == 100001:
+                        log.error("GET %s firma inválida — url=%s", path, url[:120])
+                    return data
             except Exception as e:
                 if attempt == 2:
                     log.error("GET %s error: %s", path, e)
@@ -104,7 +107,7 @@ class BingXClient:
             try:
                 qs  = _build_signed_qs(params)
                 url = "%s%s?%s" % (self.BASE, path, qs)
-                async with session.post(url) as r:
+                async with session.post(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -119,7 +122,7 @@ class BingXClient:
             try:
                 qs  = _build_signed_qs(params)
                 url = "%s%s?%s" % (self.BASE, path, qs)
-                async with session.delete(url) as r:
+                async with session.delete(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -254,13 +257,21 @@ class BingXClient:
         Si availableMargin=0 pero hay equity (posiciones abiertas),
         usa equity como proxy del capital real disponible.
         """
+        # Intentar v3 primero, luego v2 como fallback
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
             signed=True,
         )
+        if data.get("code", -1) != 0:
+            log.warning("get_balance v3 falló (code=%s) → probando v2", data.get("code"))
+            data = await self._get(
+                "/openApi/swap/v2/user/balance",
+                {"currency": "USDT"},
+                signed=True,
+            )
         raw = data.get("data", {})
-        log.info("get_balance raw: code=%s data=%s", data.get("code"), str(raw)[:300])
+        log.info("get_balance: code=%s data=%s", data.get("code"), str(raw)[:300])
 
         def _extract(d: dict) -> float:
             avail  = float(d.get("availableMargin", 0) or 0)
