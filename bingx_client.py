@@ -63,7 +63,7 @@ class BingXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._precision_map: dict[str, int]   = {}
         self._min_qty_map:   dict[str, float] = {}
-        log.info("BingXClient v6.3.2 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
+        log.info("BingXClient v6.3.3 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -260,6 +260,7 @@ class BingXClient:
             signed=True,
         )
         raw = data.get("data", {})
+        log.info("get_balance raw: code=%s data=%s", data.get("code"), str(raw)[:300])
 
         def _extract(d: dict) -> float:
             avail  = float(d.get("availableMargin", 0) or 0)
