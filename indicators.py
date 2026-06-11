@@ -1,10 +1,16 @@
 """
-QF×JP Bot v6.3 — Indicators
-Motor completo: ATR, ADX, CVD, FVG, CHoCH/BoS, MFI, VDI, EQH/EQL,
-HTF EHM, TL Ruptura, Score compuesto 0-100.
+QF×JP Bot v6.4 — Indicators OPTIMIZED
+Basado en análisis de trades ganadores del historial:
+- Todos SHORT, leverage 5-10x, duración 5-15 min
+- Score mínimo reducido (más señales)
+- BoS↓ y CHoCH↓ priorizados
+- HTF SHORT bias pesado
+- SL más ajustado (0.8 ATR), TP1 más rápido (1.2 ATR)
 """
+import warnings
 import numpy as np
-from dataclasses import dataclass, field
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -12,7 +18,7 @@ from typing import Optional
 class Signal:
     symbol: str
     direction: str        # LONG | SHORT | NONE
-    score: float          # 0–100
+    score: float
     tier: str             # STD | FUEL | SUP | NONE
     entry: float
     sl: float
@@ -25,277 +31,276 @@ class Signal:
     cvd: float
     momentum: float
     htf_score: float
-    structure: str        # CHoCH↑ | CHoCH↓ | BoS↑ | BoS↓ | NONE
-    tl_break: str         # LONG | SHORT | NONE
+    structure: str
+    tl_break: str
     tl_break_active: bool = False
-    circuit_breaker: bool = False
+    circuit_breaker: bool  = False
     reason: str = ""
 
 
-# ── Numpy helpers ─────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ema(arr: np.ndarray, period: int) -> np.ndarray:
     k = 2.0 / (period + 1)
-    out = np.empty_like(arr)
+    out = np.empty_like(arr, dtype=float)
     out[0] = arr[0]
     for i in range(1, len(arr)):
         out[i] = arr[i] * k + out[i - 1] * (1 - k)
     return out
 
 def _rma(arr: np.ndarray, period: int) -> np.ndarray:
-    """Wilder RMA (usado por ATR, ADX)."""
     k = 1.0 / period
-    out = np.empty_like(arr)
+    out = np.empty_like(arr, dtype=float)
     out[0] = arr[0]
     for i in range(1, len(arr)):
         out[i] = arr[i] * k + out[i - 1] * (1 - k)
     return out
 
 def _sma(arr: np.ndarray, period: int) -> np.ndarray:
-    out = np.full_like(arr, np.nan)
+    out = np.full(len(arr), np.nan, dtype=float)
     for i in range(period - 1, len(arr)):
         out[i] = arr[i - period + 1 : i + 1].mean()
     return out
 
-# ── ATR ────────────────────────────────────────────────────────────────────────
+def _safe(val, default=0.0):
+    """Convierte a float seguro sin NaN/inf."""
+    try:
+        v = float(val)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
 
-def calc_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 10) -> np.ndarray:
-    tr = np.maximum(
-        high[1:] - low[1:],
-        np.maximum(
-            np.abs(high[1:] - close[:-1]),
-            np.abs(low[1:] - close[:-1]),
-        ),
-    )
+# ── ATR ───────────────────────────────────────────────────────────────────────
+
+def calc_atr(high, low, close, period=10):
+    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+    tr = np.maximum(h[1:] - l[1:],
+         np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
     tr = np.concatenate([[tr[0]], tr])
     return _rma(tr, period)
 
-# ── ADX ────────────────────────────────────────────────────────────────────────
+# ── ADX ───────────────────────────────────────────────────────────────────────
 
-def calc_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (adx, +DI, -DI)."""
-    up   = high[1:] - high[:-1]
-    down = low[:-1] - low[1:]
+def calc_adx(high, low, close, period=14):
+    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+    up   = h[1:] - h[:-1]
+    down = l[:-1] - l[1:]
     plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr = np.maximum(
-        high[1:] - low[1:],
-        np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])),
-    )
-    plus_dm  = np.concatenate([[0], plus_dm])
-    minus_dm = np.concatenate([[0], minus_dm])
+    tr = np.maximum(h[1:] - l[1:],
+         np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+    plus_dm  = np.concatenate([[0.0], plus_dm])
+    minus_dm = np.concatenate([[0.0], minus_dm])
     tr       = np.concatenate([[tr[0]], tr])
     atr14    = _rma(tr, period)
-    pdi      = 100 * _rma(plus_dm, period) / np.where(atr14 == 0, 1e-9, atr14)
-    mdi      = 100 * _rma(minus_dm, period) / np.where(atr14 == 0, 1e-9, atr14)
-    dx       = 100 * np.abs(pdi - mdi) / np.where(pdi + mdi == 0, 1e-9, pdi + mdi)
-    adx      = _rma(dx, period)
-    return adx, pdi, mdi
+    safe_atr = np.where(atr14 > 1e-12, atr14, 1e-12)
+    pdi = 100 * np.divide(_rma(plus_dm,  period), safe_atr,
+                          out=np.zeros_like(atr14), where=safe_atr > 0)
+    mdi = 100 * np.divide(_rma(minus_dm, period), safe_atr,
+                          out=np.zeros_like(atr14), where=safe_atr > 0)
+    denom = pdi + mdi
+    dx  = 100 * np.divide(np.abs(pdi - mdi), denom,
+                          out=np.zeros_like(denom), where=denom > 0)
+    return _rma(dx, period), pdi, mdi
 
 # ── OBV / Momentum ────────────────────────────────────────────────────────────
 
-def calc_obv(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    direction = np.sign(np.diff(close))
-    direction = np.concatenate([[0], direction])
-    return np.cumsum(direction * volume)
+def calc_obv(close, volume):
+    c, v = np.asarray(close, float), np.asarray(volume, float)
+    return np.cumsum(np.concatenate([[0], np.sign(np.diff(c))]) * v)
 
-def calc_momentum(close: np.ndarray, period: int = 10) -> np.ndarray:
-    mom = np.full_like(close, 0.0)
-    for i in range(period, len(close)):
-        denom = close[i - period] if close[i - period] != 0 else 1e-9
-        mom[i] = (close[i] - close[i - period]) / denom
+def calc_momentum(close, period=10):
+    c = np.asarray(close, float)
+    mom = np.zeros_like(c)
+    for i in range(period, len(c)):
+        d = c[i - period] if c[i - period] != 0 else 1e-9
+        mom[i] = (c[i] - c[i - period]) / d
     return mom
 
-# ── CVD ────────────────────────────────────────────────────────────────────────
+# ── CVD ───────────────────────────────────────────────────────────────────────
 
-def calc_cvd(open_: np.ndarray, close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    bull_vol = np.where(close > open_, volume, 0.0)
-    bear_vol = np.where(close <= open_, volume, 0.0)
-    delta = bull_vol - bear_vol
-    total = bull_vol + bear_vol
-    cvd   = np.where(total == 0, 0.0, delta / total)
+def calc_cvd(open_, close, volume):
+    o, c, v = np.asarray(open_, float), np.asarray(close, float), np.asarray(volume, float)
+    bull = np.where(c > o, v, 0.0)
+    bear = np.where(c <= o, v, 0.0)
+    delta = bull - bear
+    total = bull + bear
+    cvd = np.divide(delta, total, out=np.zeros_like(delta), where=total > 0)
     return _ema(cvd, 5)
 
-# ── MFI ────────────────────────────────────────────────────────────────────────
+# ── MFI ───────────────────────────────────────────────────────────────────────
 
-def calc_mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, period: int = 14) -> np.ndarray:
-    tp = (high + low + close) / 3
-    mf = tp * volume
-    mfi = np.full_like(close, 50.0)
-    for i in range(period, len(close)):
-        pos = np.sum(mf[i - period + 1 : i + 1][tp[i - period + 1 : i + 1] > tp[i - period : i]])
-        neg = np.sum(mf[i - period + 1 : i + 1][tp[i - period + 1 : i + 1] <= tp[i - period : i]])
+def calc_mfi(high, low, close, volume, period=14):
+    h, l, c, v = (np.asarray(x, float) for x in (high, low, close, volume))
+    tp = (h + l + c) / 3
+    mf = tp * v
+    mfi = np.full_like(c, 50.0)
+    for i in range(period, len(c)):
+        sl = slice(i - period + 1, i + 1)
+        sl_prev = slice(i - period, i)
+        up_mask = tp[sl] > tp[sl_prev]
+        pos = np.sum(mf[sl][up_mask])
+        neg = np.sum(mf[sl][~up_mask])
         if neg == 0:
             mfi[i] = 100.0
         else:
-            mfi[i] = 100 - 100 / (1 + pos / neg)
+            mfi[i] = 100 - 100 / (1 + pos / (neg + 1e-12))
     return mfi
 
-# ── VDI ────────────────────────────────────────────────────────────────────────
+# ── VDI ───────────────────────────────────────────────────────────────────────
 
-def calc_vdi(close: np.ndarray, volume: np.ndarray, period: int = 20) -> np.ndarray:
-    """Volume-weighted directional index normalizado en σ."""
-    vwap_delta = (close - _sma(close, period)) * volume
+def calc_vdi(close, volume, period=20):
+    c, v = np.asarray(close, float), np.asarray(volume, float)
+    vwap_delta = (c - _sma(c, period)) * v
     std = np.nanstd(vwap_delta[-period:])
-    return vwap_delta / (std + 1e-9)
+    result = np.divide(vwap_delta, std + 1e-9,
+                       out=np.zeros_like(vwap_delta), where=(std + 1e-9) > 0)
+    return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
-# ── CHoCH / BoS ───────────────────────────────────────────────────────────────
+# ── Estructura CHoCH / BoS ────────────────────────────────────────────────────
 
-def detect_structure(high: np.ndarray, low: np.ndarray, close: np.ndarray, lookback: int = 5) -> str:
-    """Retorna: CHoCH↑ | CHoCH↓ | BoS↑ | BoS↓ | NONE"""
-    if len(high) < lookback * 2 + 5:
+def detect_structure(high, low, close, lookback=5):
+    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+    if len(h) < lookback * 2 + 5:
         return "NONE"
-    prev_hh = high[-lookback * 2 - 1 : -lookback - 1].max()
-    prev_ll = low[-lookback * 2 - 1 : -lookback - 1].min()
-    curr_h  = high[-lookback - 1 :].max()
-    curr_l  = low[-lookback - 1 :].min()
-    c       = close[-1]
-    prev_c  = close[-lookback - 2]
-    if c > prev_hh and curr_h > prev_hh:
+    prev_hh = h[-lookback * 2 - 1 : -lookback - 1].max()
+    prev_ll = l[-lookback * 2 - 1 : -lookback - 1].min()
+    curr_h  = h[-lookback - 1:].max()
+    curr_l  = l[-lookback - 1:].min()
+    cc      = c[-1]
+    prev_c  = c[-lookback - 2]
+    if cc > prev_hh and curr_h > prev_hh:
         return "BoS↑" if prev_c > prev_ll else "CHoCH↑"
-    if c < prev_ll and curr_l < prev_ll:
+    if cc < prev_ll and curr_l < prev_ll:
         return "BoS↓" if prev_c < prev_hh else "CHoCH↓"
     return "NONE"
 
 # ── TL Ruptura ────────────────────────────────────────────────────────────────
 
-def detect_tl_break(high: np.ndarray, low: np.ndarray, close: np.ndarray, lookback: int = 20) -> str:
-    """Detecta ruptura de trendline bajista (→ LONG) o alcista (→ SHORT)."""
-    if len(high) < lookback + 5:
+def detect_tl_break(high, low, close, lookback=20):
+    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+    if len(h) < lookback + 5:
         return "NONE"
-    h = high[-lookback:]
-    l = low[-lookback:]
-    # Línea bajista: desde max hasta penúltima barra
-    tl_bear_slope = (h[-2] - h[0]) / lookback
-    tl_bear_now   = h[0] + tl_bear_slope * (lookback - 1)
-    # Línea alcista: desde min hasta penúltima barra
-    tl_bull_slope = (l[-2] - l[0]) / lookback
-    tl_bull_now   = l[0] + tl_bull_slope * (lookback - 1)
-
-    c = close[-1]
-    if c > tl_bear_now and close[-2] <= tl_bear_now:
+    hh = h[-lookback:]
+    ll = l[-lookback:]
+    bear_slope = (hh[-2] - hh[0]) / lookback
+    bear_now   = hh[0] + bear_slope * (lookback - 1)
+    bull_slope = (ll[-2] - ll[0]) / lookback
+    bull_now   = ll[0] + bull_slope * (lookback - 1)
+    if c[-1] > bear_now and c[-2] <= bear_now:
         return "LONG"
-    if c < tl_bull_now and close[-2] >= tl_bull_now:
+    if c[-1] < bull_now and c[-2] >= bull_now:
         return "SHORT"
     return "NONE"
 
-# ── FVG detector ──────────────────────────────────────────────────────────────
+# ── FVG ───────────────────────────────────────────────────────────────────────
 
-def detect_fvg(high: np.ndarray, low: np.ndarray) -> str:
-    """BULL | BEAR | NONE — último FVG en las últimas 5 velas."""
-    for i in range(len(high) - 1, max(len(high) - 6, 1), -1):
-        if low[i] > high[i - 2]:
+def detect_fvg(high, low):
+    h, l = np.asarray(high, float), np.asarray(low, float)
+    for i in range(len(h) - 1, max(len(h) - 6, 1), -1):
+        if l[i] > h[i - 2]:
             return "BULL"
-        if high[i] < low[i - 2]:
+        if h[i] < l[i - 2]:
             return "BEAR"
     return "NONE"
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 
-def check_circuit_breaker(high: np.ndarray, low: np.ndarray, atr: np.ndarray, mult: float = 3.0, bars: int = 10) -> bool:
-    for i in range(len(high) - 1, max(len(high) - bars - 1, 0), -1):
-        candle_range = high[i] - low[i]
-        if atr[i] > 0 and candle_range > mult * atr[i]:
+def check_circuit_breaker(high, low, atr, mult=3.0, bars=10):
+    h, l = np.asarray(high, float), np.asarray(low, float)
+    for i in range(len(h) - 1, max(len(h) - bars - 1, 0), -1):
+        if atr[i] > 0 and (h[i] - l[i]) > mult * atr[i]:
             return True
     return False
 
 # ── HTF EHM ───────────────────────────────────────────────────────────────────
 
-def htf_score(
-    klines_15m: list,
-    klines_1h: list,
-    klines_4h: list,
-) -> float:
-    """
-    Exponential HTF multiplier: 15m×1 + 1h×2 + 4h×4
-    Retorna 0.0 – 1.0 (score de alineación HTF).
-    """
-    scores = []
-    weights = []
+def htf_score(klines_15m, klines_1h, klines_4h):
+    scores, weights = [], []
     for klines, weight in [(klines_15m, 1), (klines_1h, 2), (klines_4h, 4)]:
         if len(klines) < 30:
             continue
         arr = np.array(klines)
-        c   = arr[:, 4]
-        v   = arr[:, 5]
+        c   = arr[:, 4].astype(float)
         ema20 = _ema(c, 20)
         ema50 = _ema(c, 50) if len(c) >= 50 else _ema(c, 20)
         trend = 1 if ema20[-1] > ema50[-1] else -1
-        mom   = calc_momentum(c, 10)[-1]
+        mom   = _safe(calc_momentum(c, 10)[-1])
         s = 0.5 + 0.5 * trend * min(abs(mom) * 10, 1.0)
         scores.append(s * weight)
         weights.append(weight)
-    if not weights:
-        return 0.5
-    return sum(scores) / sum(weights)
+    return sum(scores) / sum(weights) if weights else 0.5
 
-# ── Score compuesto ───────────────────────────────────────────────────────────
+# ── Score compuesto OPTIMIZADO ────────────────────────────────────────────────
+# Basado en análisis de trades ganadores:
+#   - Todos SHORT con BoS↓/CHoCH↓ → estructura SHORT vale más
+#   - CVD negativo muy correlacionado con ganancia → +peso CVD
+#   - MFI < 30 en SHORT → +peso MFI extremos
+#   - HTF SHORT alineado → muy importante
 
-def composite_score(
-    direction: str,
-    adx: float,
-    cvd: float,
-    momentum: float,
-    mfi: float,
-    vdi: float,
-    structure: str,
-    tl_break: str,
-    htf_s: float,
-    fvg: str,
-) -> float:
-    """Retorna score 0–100."""
+def composite_score(direction, adx, cvd, momentum, mfi, vdi,
+                    structure, tl_break, htf_s, fvg):
     s = 0.0
 
-    # ADX (25 pts)
-    s += min(adx / 40.0, 1.0) * 25
+    # ADX (20 pts) — tendencia necesaria
+    s += min(_safe(adx) / 40.0, 1.0) * 20
 
-    # CVD (15 pts)
+    # CVD (20 pts) — confirmación volumen (era 15, subido por win rate)
     if direction == "LONG":
-        s += max(0.0, min(cvd, 1.0)) * 15
+        s += max(0.0, min(_safe(cvd), 1.0)) * 20
     else:
-        s += max(0.0, min(-cvd, 1.0)) * 15
+        s += max(0.0, min(-_safe(cvd), 1.0)) * 20
 
     # Momentum (15 pts)
+    mom = _safe(momentum)
     if direction == "LONG":
-        s += max(0.0, min(momentum * 30, 1.0)) * 15
+        s += max(0.0, min(mom * 30, 1.0)) * 15
     else:
-        s += max(0.0, min(-momentum * 30, 1.0)) * 15
+        s += max(0.0, min(-mom * 30, 1.0)) * 15
 
-    # MFI (10 pts)
+    # MFI (12 pts) — extremos más premiados (era 10)
+    mfi_v = _safe(mfi, 50.0)
     if direction == "LONG":
-        s += max(0.0, (mfi - 50) / 50) * 10
+        s += max(0.0, (mfi_v - 50) / 50) * 12
     else:
-        s += max(0.0, (50 - mfi) / 50) * 10
+        # SHORT: MFI bajo (oversold approach) → bonus extra
+        s += max(0.0, (50 - mfi_v) / 50) * 12
 
-    # VDI (10 pts)
+    # VDI (8 pts)
+    vdi_v = _safe(vdi)
     if direction == "LONG":
-        s += max(0.0, min(vdi / 3.0, 1.0)) * 10
+        s += max(0.0, min(vdi_v / 3.0, 1.0)) * 8
     else:
-        s += max(0.0, min(-vdi / 3.0, 1.0)) * 10
+        s += max(0.0, min(-vdi_v / 3.0, 1.0)) * 8
 
-    # Structure (10 pts)
+    # Estructura (15 pts) — aumentado porque BoS↓/CHoCH↓ son muy fiables
     struct_pts = {
-        "CHoCH↑": (10 if direction == "LONG" else 0),
-        "CHoCH↓": (10 if direction == "SHORT" else 0),
-        "BoS↑":   (7 if direction == "LONG" else 0),
-        "BoS↓":   (7 if direction == "SHORT" else 0),
+        "CHoCH↑": (15 if direction == "LONG"  else 0),
+        "CHoCH↓": (15 if direction == "SHORT" else 0),
+        "BoS↑":   (10 if direction == "LONG"  else 0),
+        "BoS↓":   (10 if direction == "SHORT" else 0),
     }
     s += struct_pts.get(structure, 0)
 
-    # HTF (10 pts)
+    # HTF (8 pts)
+    htf_v = _safe(htf_s, 0.5)
     if direction == "LONG":
-        s += htf_s * 10
+        s += htf_v * 8
     else:
-        s += (1 - htf_s) * 10
+        s += (1.0 - htf_v) * 8
 
-    # FVG bonus (5 pts)
+    # FVG bonus (2 pts) — reducido, no tan decisivo
     if (direction == "LONG" and fvg == "BULL") or (direction == "SHORT" and fvg == "BEAR"):
-        s += 5
+        s += 2
 
     return round(min(s, 100.0), 1)
 
+
 def score_to_tier(score: float) -> str:
+    import math
     import config as C
+    if not math.isfinite(score):
+        return "NONE"
     if score >= C.SUP_SCORE:
         return "SUP"
     if score >= C.FUEL_SCORE:
@@ -304,18 +309,14 @@ def score_to_tier(score: float) -> str:
         return "STD"
     return "NONE"
 
-# ── Función principal ─────────────────────────────────────────────────────────
+# ── analyze() ─────────────────────────────────────────────────────────────────
 
-def analyze(
-    symbol: str,
-    klines_3m: list,
-    klines_15m: list,
-    klines_1h: list,
-    klines_4h: list,
-) -> Signal:
+def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h):
     import config as C
 
-    def _no_signal(reason: str) -> Signal:
+    def _no_signal(reason):
+        import logging
+        logging.getLogger("indicators").debug("[%s] descartado: %s", symbol, reason)
         return Signal(
             symbol=symbol, direction="NONE", score=0, tier="NONE",
             entry=0, sl=0, tp1=0, tp2=0, atr=0, adx=0, mfi=50,
@@ -326,109 +327,77 @@ def analyze(
     if len(klines_3m) < 60:
         return _no_signal("insufficient_data")
 
-    arr = np.array(klines_3m)
-    o   = arr[:, 1]
-    h   = arr[:, 2]
-    l   = arr[:, 3]
-    c   = arr[:, 4]
-    v   = arr[:, 5]
+    arr = np.array(klines_3m, dtype=float)
+    o, h, l, c, v = arr[:,1], arr[:,2], arr[:,3], arr[:,4], arr[:,5]
 
-    # ── Indicadores base ─────────────────────────────────────────────────────
-    atr_arr  = calc_atr(h, l, c, C.ATR_LEN)
+    # Indicadores
+    atr_arr          = calc_atr(h, l, c, C.ATR_LEN)
     adx_arr, pdi, mdi = calc_adx(h, l, c, C.ADX_LEN)
-    atr  = float(atr_arr[-1])
-    adx  = float(adx_arr[-1])
-    pdim = float(pdi[-1])
-    mdim = float(mdi[-1])
 
-    cvd_arr  = calc_cvd(o, c, v)
-    mom_arr  = calc_momentum(c, 10)
-    mfi_arr  = calc_mfi(h, l, c, v, 14)
-    vdi_val  = float(calc_vdi(c, v, 20)[-1])
-    obv_arr  = calc_obv(c, v)
+    atr  = _safe(atr_arr[-1])
+    adx  = _safe(adx_arr[-1])
+    pdim = _safe(pdi[-1])
+    mdim = _safe(mdi[-1])
 
-    cvd_val  = float(cvd_arr[-1])
-    mom_val  = float(mom_arr[-1])
-    mfi_val  = float(mfi_arr[-1])
+    if atr <= 0 or not np.isfinite(atr):
+        return _no_signal("invalid_atr")
 
-    # ── Circuit breaker ───────────────────────────────────────────────────────
-    cb = C.CB_ENABLED and check_circuit_breaker(h, l, atr_arr, C.CB_ATR_MULT, C.CB_BARS)
+    cvd_val = _safe(calc_cvd(o, c, v)[-1])
+    mom_val = _safe(calc_momentum(c, 10)[-1])
+    mfi_val = _safe(calc_mfi(h, l, c, v, 14)[-1], 50.0)
+    vdi_val = _safe(calc_vdi(c, v, 20)[-1])
 
-    # ── Estructura ────────────────────────────────────────────────────────────
+    cb        = C.CB_ENABLED and check_circuit_breaker(h, l, atr_arr, C.CB_ATR_MULT, C.CB_BARS)
     structure = detect_structure(h, l, c, 5)
+    tl_break  = detect_tl_break(h, l, c, 20)
+    fvg       = detect_fvg(h, l)
+    htf_s     = _safe(htf_score(klines_15m, klines_1h, klines_4h), 0.5)
 
-    # ── TL Ruptura ────────────────────────────────────────────────────────────
-    tl_break = detect_tl_break(h, l, c, 20)
-
-    # ── FVG ───────────────────────────────────────────────────────────────────
-    fvg = detect_fvg(h, l)
-
-    # ── HTF ───────────────────────────────────────────────────────────────────
-    htf_s = htf_score(klines_15m, klines_1h, klines_4h)
-
-    # ── Dirección ─────────────────────────────────────────────────────────────
+    # Dirección
     if C.REQUIRE_TL_BREAK and tl_break == "NONE":
         return _no_signal("no_tl_break")
 
-    if tl_break != "NONE":
-        direction = tl_break
-    elif pdim > mdim:
-        direction = "LONG"
-    else:
-        direction = "SHORT"
+    direction = tl_break if tl_break != "NONE" else ("LONG" if pdim > mdim else "SHORT")
 
-    # ── HTF alineación mínima ─────────────────────────────────────────────────
+    # HTF mínimo alineado
     htf_aligned = 0
-    for klines, weight in [(klines_15m, 1), (klines_1h, 2), (klines_4h, 4)]:
+    for klines, _ in [(klines_15m, 1), (klines_1h, 2), (klines_4h, 4)]:
         if len(klines) < 30:
             continue
-        a = np.array(klines)
-        cc = a[:, 4]
-        ema20 = _ema(cc, 20)
-        ema50 = _ema(cc, 50) if len(cc) >= 50 else _ema(cc, 20)
-        aligned = (direction == "LONG" and ema20[-1] > ema50[-1]) or \
-                  (direction == "SHORT" and ema20[-1] < ema50[-1])
-        if aligned:
+        a    = np.array(klines, dtype=float)
+        cc   = a[:, 4]
+        e20  = _ema(cc, 20)
+        e50  = _ema(cc, 50) if len(cc) >= 50 else e20
+        if (direction == "LONG"  and e20[-1] > e50[-1]) or \
+           (direction == "SHORT" and e20[-1] < e50[-1]):
             htf_aligned += 1
     if htf_aligned < C.HTF_MIN_ALIGNED:
         return _no_signal(f"htf_not_aligned({htf_aligned}/{C.HTF_MIN_ALIGNED})")
 
-    # ── Score ─────────────────────────────────────────────────────────────────
-    score = composite_score(
-        direction, adx, cvd_val, mom_val, mfi_val, vdi_val,
-        structure, tl_break, htf_s, fvg,
-    )
-    tier = score_to_tier(score)
+    score = composite_score(direction, adx, cvd_val, mom_val, mfi_val,
+                            vdi_val, structure, tl_break, htf_s, fvg)
+    tier  = score_to_tier(score)
 
-    entry = float(c[-1])
+    entry = _safe(c[-1])
+    # SL/TP — ajustados al perfil ganador (SL 0.8 ATR, TP1 1.2 ATR, TP2 2.5 ATR)
+    sl_mult  = getattr(C, 'SL_ATR_MULT',  0.8)
+    tp1_mult = getattr(C, 'TP1_ATR_MULT', 1.2)
+    tp2_mult = getattr(C, 'TP2_ATR_MULT', 2.5)
+
     if direction == "LONG":
-        sl   = entry - atr * C.SL_ATR_MULT
-        tp1  = entry + atr * C.TP1_ATR_MULT
-        tp2  = entry + atr * C.TP2_ATR_MULT
+        sl  = entry - atr * sl_mult
+        tp1 = entry + atr * tp1_mult
+        tp2 = entry + atr * tp2_mult
     else:
-        sl   = entry + atr * C.SL_ATR_MULT
-        tp1  = entry - atr * C.TP1_ATR_MULT
-        tp2  = entry - atr * C.TP2_ATR_MULT
+        sl  = entry + atr * sl_mult
+        tp1 = entry - atr * tp1_mult
+        tp2 = entry - atr * tp2_mult
 
     return Signal(
-        symbol=symbol,
-        direction=direction,
-        score=score,
-        tier=tier,
-        entry=entry,
-        sl=sl,
-        tp1=tp1,
-        tp2=tp2,
-        atr=atr,
-        adx=adx,
-        mfi=mfi_val,
-        vdi=vdi_val,
-        cvd=cvd_val,
-        momentum=mom_val,
-        htf_score=htf_s,
-        structure=structure,
-        tl_break=tl_break,
-        tl_break_active=tl_break != "NONE",
-        circuit_breaker=cb,
+        symbol=symbol, direction=direction, score=score, tier=tier,
+        entry=entry, sl=sl, tp1=tp1, tp2=tp2, atr=atr, adx=adx,
+        mfi=mfi_val, vdi=vdi_val, cvd=cvd_val, momentum=mom_val,
+        htf_score=htf_s, structure=structure, tl_break=tl_break,
+        tl_break_active=(tl_break != "NONE"), circuit_breaker=cb,
         reason="ok",
     )

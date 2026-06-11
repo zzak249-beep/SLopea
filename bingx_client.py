@@ -1,13 +1,7 @@
 """
-QF×JP Bot v6.3.3 — BingX Client
+QF×JP Bot v6.3.2 — BingX Client
 FIRMA: parseParam oficial BingX
   sorted(params) + &timestamp=xxx al final → HMAC → &signature=xxx
-
-FIX v6.3.3:
-  [FIX] .strip() en API_KEY y SECRET_KEY  →  elimina whitespace/newlines de Railway env vars
-  [FIX] place_stop_market_order: hedge mode ISOLATED siempre closePosition=false + qty explícita
-        closePosition=true con quantity=0 causa error 109400 en hedge mode
-  [FIX] open_trade: logging individual de fallos en SL/TP1/TP2
 """
 import hmac
 import hashlib
@@ -49,9 +43,8 @@ def _build_signed_qs(params: dict) -> str:
     base        = "&".join(parts)
     ts          = _ts()
     payload     = (base + "&timestamp=" + ts) if base else ("timestamp=" + ts)
-    # FIX v6.3.3: .strip() elimina whitespace/newlines de Railway env vars
     signature   = hmac.new(
-        C.BINGX_SECRET_KEY.strip().encode("utf-8"),
+        C.BINGX_SECRET_KEY.encode("utf-8"),
         payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
@@ -70,13 +63,12 @@ class BingXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._precision_map: dict[str, int]   = {}
         self._min_qty_map:   dict[str, float] = {}
-        log.info("BingXClient v6.3.3 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
+        log.info("BingXClient v6.3.2 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                # FIX v6.3.3: .strip() en API key
-                headers={"X-BX-APIKEY": C.BINGX_API_KEY.strip()},
+                headers={"X-BX-APIKEY": C.BINGX_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=15),
             )
         return self._session
@@ -257,29 +249,48 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
+        """
+        Retorna availableMargin USDT.
+        Si availableMargin=0 pero hay equity (posiciones abiertas),
+        usa equity como proxy del capital real disponible.
+        """
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
             signed=True,
         )
         raw = data.get("data", {})
+
+        def _extract(d: dict) -> float:
+            avail  = float(d.get("availableMargin", 0) or 0)
+            equity = float(d.get("equity",          0) or 0)
+            # Si availableMargin=0 pero hay equity → posiciones abiertas
+            # devolver equity para que kelly_position_size pueda calcular
+            if avail > 0:
+                return avail
+            if equity > 0:
+                log.debug("availableMargin=0, usando equity=%.4f", equity)
+                return equity
+            return 0.0
+
         if isinstance(raw, list):
             for a in raw:
                 if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                    return float(a.get("availableMargin", 0) or 0)
+                    return _extract(a)
             for a in raw:
-                v = (a or {}).get("availableMargin")
-                if v is not None:
-                    return float(v or 0)
+                if isinstance(a, dict) and ("availableMargin" in a or "equity" in a):
+                    return _extract(a)
             return 0.0
+
         if isinstance(raw, dict):
             bal = raw.get("balance", raw)
             if isinstance(bal, list):
                 for a in bal:
                     if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                        return float(a.get("availableMargin", 0) or 0)
+                        return _extract(a)
             if isinstance(bal, dict):
-                return float(bal.get("availableMargin", 0) or 0)
+                return _extract(bal)
+
         log.warning("get_balance: formato inesperado %s", str(data)[:200])
         return 0.0
 
@@ -333,27 +344,18 @@ class BingXClient:
 
     async def place_stop_market_order(
         self, symbol: str, side: str, quantity: float, stop_price: float,
-        position_side: str = "LONG",
+        position_side: str = "LONG", close_position: bool = True,
         order_type: str = "STOP_MARKET",
     ) -> dict:
-        """
-        Coloca SL o TP.
-        FIX v6.3.3: Hedge mode ISOLATED requiere closePosition=false + qty explícita.
-        closePosition=true con quantity=0 → error 109400 en hedge mode ISOLATED.
-        """
         qty = self._round_qty(symbol, quantity)
-        if qty <= 0:
-            log.warning("[%s] %s qty=0 tras redondeo (orig=%.6f) → skip",
-                        symbol, order_type, quantity)
-            return {"code": -1, "msg": "qty_zero_after_round"}
         params = {
             "symbol":        symbol,
             "side":          side,
             "positionSide":  position_side,
             "type":          order_type,
             "stopPrice":     str(round(stop_price, 8)),
-            "closePosition": "false",   # HEDGE MODE: siempre false
-            "quantity":      str(qty),  # HEDGE MODE: siempre qty explícita
+            "closePosition": "true" if close_position else "false",
+            "quantity":      "0" if close_position else str(qty),
             "workingType":   "MARK_PRICE",
             "priceProtect":  "true",
         }
@@ -409,35 +411,17 @@ class BingXClient:
 
         await asyncio.sleep(0.5)
 
-        # SL — qty completa
-        sl_resp = await self.place_stop_market_order(
+        results["sl"] = await self.place_stop_market_order(
             symbol, side_close, qty, sl_price, direction,
-            order_type="STOP_MARKET",
+            close_position=True, order_type="STOP_MARKET",
         )
-        results["sl"] = sl_resp
-        if sl_resp.get("code", -1) != 0:
-            log.error("[%s] SL placement failed (code=%s): %s",
-                      symbol, sl_resp.get("code"), sl_resp.get("msg"))
-
-        # TP1 y TP2 — qty mitad cada uno
         qty_half = self._round_qty(symbol, qty / 2)
-
-        tp1_resp = await self.place_stop_market_order(
+        results["tp1"] = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
-            order_type="TAKE_PROFIT_MARKET",
+            close_position=False, order_type="TAKE_PROFIT_MARKET",
         )
-        results["tp1"] = tp1_resp
-        if tp1_resp.get("code", -1) != 0:
-            log.error("[%s] TP1 placement failed (code=%s): %s",
-                      symbol, tp1_resp.get("code"), tp1_resp.get("msg"))
-
-        tp2_resp = await self.place_stop_market_order(
+        results["tp2"] = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp2_price, direction,
-            order_type="TAKE_PROFIT_MARKET",
+            close_position=False, order_type="TAKE_PROFIT_MARKET",
         )
-        results["tp2"] = tp2_resp
-        if tp2_resp.get("code", -1) != 0:
-            log.error("[%s] TP2 placement failed (code=%s): %s",
-                      symbol, tp2_resp.get("code"), tp2_resp.get("msg"))
-
         return results
