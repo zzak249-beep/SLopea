@@ -1,170 +1,88 @@
-# QF×JP Bot v6.3 PREDATOR·ENTRY 🤖
+# Crowding bot — solo señales
 
-Bot de trading automático que replica la estrategia **QF Machine × JP Fusion** en Python puro.  
-Conectado a **BingX Perpetual Futures** · Notificaciones **Telegram** · Deploy **Railway**.
+Bot de señales del posicionamiento amontonado en perpetuos de BingX.
+**NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos.
 
----
+## Despliegue en Railway — los cuatro puntos donde siempre falla
 
-## Novedades v6.3 vs v3.5
+1. **Builder: NIXPACKS.** No Dockerfile. Con Dockerfile no se instala
+   `requests` y el build muere sin dejar nada en los Deploy Logs.
+2. **Start Command: `python crowding_bot.py`.** SIN el `worker:` delante.
+   Eso es sintaxis de Procfile; Railway lo ejecuta literal y busca un
+   programa llamado `worker:`.
+3. **Pre-deploy Command: VACÍO.** `crowding_bot.py` es un bucle infinito y
+   nunca termina, así que como pre-deploy deja el despliegue en cola para
+   siempre.
+4. **Volume montado en `/data`.** Sin él, cada redeploy borra 30-55 horas
+   de calentamiento. Créalo ANTES de arrancar, no después.
 
-| Feature | v3.5 | v6.3 |
-|---|---|---|
-| Universo de símbolos | TOP 30 | **TODAS las monedas BingX** (TOP_N=0) |
-| Cierre de posiciones | Solo SL/TP automático vía API | **Position Manager completo** |
-| Breakeven | ✗ | ✅ Automático (1 ATR) |
-| Monitor posiciones | ✗ | ✅ Loop cada 30s |
-| Cierre manual | ✗ | ✅ `POST /close/{symbol}` |
-| Cierre emergencia | ✗ | ✅ con cancelación de órdenes |
-| Endpoint `/positions` | ✗ | ✅ Posiciones live desde BingX |
-| Filtro volumen mínimo | ✗ | ✅ `MIN_VOLUME_USDT` |
-
----
-
-## Arquitectura
+## Variables (raw editor)
 
 ```
-src/
-├── main.py             # FastAPI + healthcheck + arranque de loops
-├── scanner.py          # Loop: obtiene símbolos → analiza → abre trades
-├── indicators.py       # ATR, ADX, CVD, FVG, CHoCH/BoS, MFI, VDI, TL Ruptura, Score
-├── bingx_client.py     # API BingX: klines, órdenes MARKET, SL/TP, cierre posiciones
-├── position_manager.py # Monitor posiciones abiertas, breakeven, cierre emergencia
-├── telegram_client.py  # Notificaciones: señal, apertura, cierre, status, errores
-├── risk_manager.py     # Kelly Criterion, límites diarios, daily drawdown
-└── config.py           # Variables via env vars
+TIMEFRAME=15m
+SCAN_SEC=120
+MIN_VOL_24H=2000000
+MAX_SYMBOLS=300
+MAX_WORKERS=20
+KLINES_LIMIT=260
+HIST_HORAS=168
+MIN_HORAS=30
+MIN_MUESTRAS=200
+MUESTRA_MIN_SEG=300
+MAX_PUNTOS=2200
+OI_LOOK_H=6
+Z_BASIS=2.0
+Z_OI=1.0
+EXT_PCT=80
+ATR_LEN=14
+SL_ATR=1.5
+TP_R=2.0
+MAX_BARS=16
+MIN_ATR_PCT=0
+MAX_ATR_PCT=8
+COST_PCT=0.25
+MAX_COST_R=0.20
+SOLO_VELA_CERRADA=true
+NO_NUEVO_EXTREMO=6
+ENFRIA_BARRAS=8
+PANEL_ENABLED=true
+PANEL_CSV=/data/crowding_panel.csv
+PANEL_CADA_SEG=900
+STATE=/data/crowding_state.json
+CSV=/data/crowding_ops.csv
+CSV_CON_INFORME=true
+CSV_AL_ARRANCAR=false
+TG_TOKEN=
+TG_CHAT=
+TG_SIGNALS=false
+TG_CLOSES=false
+REPORT_HOUR=7
+CONFIRM_ENABLED=true
 ```
 
----
+## Qué hace cada archivo
 
-## Lógica de señal
-
-1. **TL Ruptura** (gate principal): ruptura de trendline bajista → LONG, alcista → SHORT
-2. **HTF EHM**: 15m×1 + 1h×2 + 4h×4 — mínimo 2 TFs alineados
-3. **Score compuesto** (0–100): ADX + CVD + Momentum + MFI + VDI + Estructura + HTF + FVG
-4. **Tiers**: STD ≥55 · FUEL ≥68 · SUP ≥80
-5. **Circuit Breaker**: pausa 10min tras vela >3×ATR
-6. **Kelly sizing**: posición ajustada al tier, score y balance real
-
----
-
-## Gestión de posiciones (v6.3)
-
-- **SL + TP1 (50%) + TP2 (50%)** colocados automáticamente como stop-market en BingX
-- **Breakeven**: cuando el precio avanza `BREAKEVEN_ATR_MULT × ATR`, el SL se mueve a entry
-- **Monitor loop**: cada `POSITION_CHECK_INTERVAL` segundos sincroniza con posiciones reales en BingX
-- **Cierre automático detectado**: si la posición desaparece de BingX (SL/TP hit), notifica PnL por Telegram
-- **Cierre manual**: `POST /close/{symbol}` desde cualquier cliente HTTP
-
----
-
-## Deploy Railway
-
-### 1. Estructura de archivos
-```
-qfjp-bot/
-├── src/
-│   ├── main.py
-│   ├── scanner.py
-│   ├── indicators.py
-│   ├── bingx_client.py
-│   ├── position_manager.py
-│   ├── telegram_client.py
-│   ├── risk_manager.py
-│   └── config.py
-├── .env.example
-├── .gitignore
-├── Procfile
-├── railway.toml
-└── requirements.txt
-```
-
-### 2. Subir a GitHub
-```bash
-git init
-git add .
-git commit -m "QFxJP Bot v6.3"
-git remote add origin https://github.com/TU_USUARIO/qfjp-bot
-git push -u origin main
-```
-
-### 3. Railway → New Project → Deploy from GitHub
-
-### 4. Variables de entorno (Railway → Variables)
-
-| Variable | Valor recomendado |
+| archivo | para qué |
 |---|---|
-| `BINGX_API_KEY` | tu API key |
-| `BINGX_SECRET_KEY` | tu secret key |
-| `TELEGRAM_TOKEN` | token del bot |
-| `TELEGRAM_CHAT_ID` | ID canal/grupo |
-| `MODE` | `SIGNAL` primero, luego `LIVE` |
-| `CAPITAL` | tu capital en USDT |
-| `MIN_TIER` | `FUEL` |
-| `TOP_N_SYMBOLS` | `0` (todas) o número |
-| `MIN_VOLUME_USDT` | `5000000` |
-| `SCAN_INTERVAL` | `180` |
-| `LEVERAGE` | `10` |
-| `POSITION_CHECK_INTERVAL` | `30` |
-| `BREAKEVEN_ATR_MULT` | `1.0` |
+| `crowding_bot.py` | el bot. Detecta amontonamiento, espera la vela en contra, abre operación virtual y mide el resultado en R |
+| `confirm.py` | régimen por ratio de varianzas. Solo APUNTA, nunca decide |
+| `panel.py` | diario transversal: guarda los 300 símbolos cada 15 min, no solo los que disparan |
+| `analizar_panel.py` | se ejecuta a mano. Contesta si el basis ordena los retornos futuros, sin necesitar ni una operación cerrada |
 
-Ver `.env.example` para la lista completa.
+## Calentamiento
 
----
+30 h de historia Y 200 muestras por símbolo. Con `MUESTRA_MIN_SEG=300` eso
+son unas **30-35 horas de reloj**. Hasta entonces, 0 señales es lo correcto.
 
-## Modos
+## Cómo leer los resultados
 
-- **`MODE=SIGNAL`**: escanea y notifica en Telegram, **sin** abrir trades reales
-- **`MODE=LIVE`**: abre trades reales + monitor de cierre automático + breakeven
-
----
-
-## Endpoints
-
-| Endpoint | Descripción |
+| ventaja real | operaciones necesarias |
 |---|---|
-| `GET /health` | Healthcheck Railway |
-| `GET /status` | Estado del bot, balance, trades abiertos, risk |
-| `GET /positions` | Posiciones abiertas live desde BingX |
-| `POST /close/{SYMBOL}` | Cierre manual forzado (ej: `/close/BTC-USDT`) |
+| 0.50 R/op | 31 |
+| 0.30 R/op | 87 |
+| 0.20 R/op | 196 |
+| 0.10 R/op | 784 |
 
----
-
-## Panel Telegram — Señal
-
-```
-📡 SEÑAL — QF×JP v6.3
-──────────────────────
-Par:       BTC-USDT
-Dir:       🟢 LONG
-Tier:      🔥 FUEL
-Score:     71/100  ███████░░░
-──────────────────────
-Entry:     43250.000000
-SL:        42890.000000
-TP1 (50%): 43790.000000
-TP2 (50%): 44330.000000
-ATR:       360.000000
-──────────────────────
-TL Ruptura:  LONG 🔥
-Estructura:  BoS↑
-ADX:         32.4
-MFI:         38.2
-VDI:         🟢 BULL (+1.82σ)
-HTF Score:   86%
-CVD:         +0.412
-Momentum:    +0.338
-```
-
----
-
-## Configuración recomendada para inicio
-
-```
-MODE=SIGNAL           # Empieza en modo señal 1-2 días
-MIN_TIER=FUEL
-TOP_N_SYMBOLS=0       # Todas las monedas
-MIN_VOLUME_USDT=10000000   # Solo monedas con >10M vol
-MAX_OPEN_TRADES=3
-RISK_PCT=0.5          # Conservador al inicio
-KELLY_FRACTION=0.15
-```
+Y lo que de verdad limita no son las operaciones sino los **días**
+independientes: 40 cortos abiertos durante el mismo desplome son una sola
+observación, no 40. El informe avisa cuando un día domina el total.

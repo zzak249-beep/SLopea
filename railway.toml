@@ -1,0 +1,12 @@
+[build]
+# Railpack es ahora el constructor por defecto de Railway. Nixpacks está
+# obsoleto y "NIXPACKS" ya ni siquiera es un valor válido para "builder" —
+# por eso el build fallaba ("no se pudo construir una imagen"): Railway
+# intentaba compilar con Railpack igualmente y el archivo entraba en
+# conflicto consigo mismo. RAILPACK es hoy el único valor junto a DOCKERFILE.
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "python crowding_bot.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
