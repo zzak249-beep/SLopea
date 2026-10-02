@@ -115,7 +115,23 @@ def rss_mb():
         return 0.0
 
 
+def keepalive():
+    """Railway (App Sleeping/Serverless) duerme el servicio tras ~10 min sin tráfico de salida; los pasos de
+    cálculo con datos en caché no salen a la red. Un ping ligero cada 4 min lo mantiene despierto."""
+    import threading
+
+    def loop():
+        while True:
+            time.sleep(240)
+            try:
+                requests.get("https://api.telegram.org", timeout=10)
+            except requests.RequestException:
+                pass
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def run():
+    keepalive()
     os.makedirs(C.DATA_DIR, exist_ok=True)
     syms = [s.strip().upper() for s in env("RESEARCH_SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
     tf = env("RESEARCH_TF", C.TIMEFRAME)
