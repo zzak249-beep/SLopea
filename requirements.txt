@@ -1,7 +1,0 @@
-requests>=2.31.0
-# crowding_bot.py importa urllib3 directamente (HTTPAdapter + Retry para el
-# pooling de conexiones, ver líneas 74-75 y 93-101). Antes solo llegaba como
-# dependencia transitiva de requests, sin garantía de versión: declararlo
-# aparte evita que un build resuelva una versión con la que ese código no
-# funcione.
-urllib3>=2.0.0
