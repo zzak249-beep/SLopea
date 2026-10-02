@@ -54,7 +54,7 @@ def main():
     tr = sorted(select_trades(allc, cfg), key=lambda x: x["open_t"])
     print(f"{len(tr)} operaciones · {len(syms)} símbolos · {args.tf} · {args.days} días · exigencia {args.strict}")
     if len(tr) < 80:
-        print("⚠ Menos de 80 operaciones: el modelo aprendería ruido. Añade símbolos o días, o usa un TF menor.")
+        print("⚠ Menos de 80 operaciones: el modelo aprendería ruido. Añade símbolos o días (más histórico).")
         if len(tr) < 30:
             return
     cutoff = tr[0]["open_t"] + (tr[-1]["open_t"] - tr[0]["open_t"]) * 0.7

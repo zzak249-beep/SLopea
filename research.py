@@ -24,6 +24,8 @@ import requests
 
 import config as C
 
+EXTRA_SYMBOLS = ("LTCUSDT,BCHUSDT,TRXUSDT,NEARUSDT,ATOMUSDT,UNIUSDT,AAVEUSDT,FILUSDT,APTUSDT,ARBUSDT,OPUSDT,"
+                 "INJUSDT,SUIUSDT,SEIUSDT,TIAUSDT,LDOUSDT,ETCUSDT,XLMUSDT,HBARUSDT,ALGOUSDT")
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT"
 KEY_LINES = re.compile(r"(TOTAL|primer 70|último 30|^t [+-]|trampas|·con entrada|AUC|todas las señales|filtradas|"
                        r"prueba de azar|^→|Mejor en entrenamiento|⚠|✓|Guardado|No se guarda|operaciones ·)")
@@ -154,6 +156,17 @@ def run():
         syms = [s if "-" in s else s.replace("USDT", "-USDT") for s in syms]
     B.SOURCE = source
     C.META_MODEL = os.path.join(C.DATA_DIR, "meta_model.json")
+    auto = env("RESEARCH_AUTO", "true").lower() in ("true", "1", "si", "sí")
+    auto_notes = []
+    if auto and source == "bingx" and C.tf_seconds(tf) < 3600 and int(days) > 90:
+        auto_notes.append(f"⚙ {tf} → 1h: BingX solo guarda ~96 días en {tf} y la prueba repetiría la misma muestra pequeña.")
+        tf = "1h"
+    if auto and len(syms) < 20:
+        extra = [s if source == "binance" else s.replace("USDT", "-USDT") for s in EXTRA_SYMBOLS.split(",")]
+        syms = syms + [s for s in extra if s not in syms]
+        auto_notes.append(f"⚙ Amplío a {len(syms)} símbolos para tener muestra suficiente.")
+    if auto_notes:
+        auto_notes.append("(RESEARCH_AUTO=false para usar exactamente tus variables)")
     sym_arg = ",".join(syms)
     low_tf = C.tf_seconds(tf) < 3600
     t0 = time.time()
@@ -179,6 +192,7 @@ def run():
                "\n⚠ Binance bloquea esta región (EE. UU.): datos de BingX y SIN flujo agresor."
                + ("\n⚠ BingX solo guarda ~100 días de velas de 15m o menos: el backtest cubrirá eso, no los días "
                   "pedidos. Para un año entero: región Europa (Binance) o RESEARCH_TF=1h." if low_tf else ""))
+            + ("\n" + "\n".join(auto_notes) if auto_notes else "")
             + "\nTe mando cada paso al terminarlo.")
 
     for st in pending:
