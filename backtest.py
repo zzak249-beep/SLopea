@@ -1,0 +1,227 @@
+"""
+Backtest local con el MISMO motor, plan, filtros y gestión que el bot.
+
+  python backtest.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --tf 15m --days 180
+  python backtest.py --symbols BTCUSDT,ETHUSDT --tf 1h --days 365 --strict Conservador --context-filter bloquea
+
+Datos: endpoint público de Binance Futures (sin key), cacheados en ./cache.
+Sin mirar el futuro: entra al cierre de la vela que valida la entrada; el contexto (CONTEXT_TF) y la EMA
+solo ven velas superiores YA CERRADAS. Gestión: TP1 parcial + SL a BE, resto TP2; si una vela toca SL y TP
+cuenta el SL; descuenta comisión + deslizamiento por lado en R.
+"""
+import argparse
+import math
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from statistics import NormalDist
+
+import requests
+
+import config as C
+from strategy import scan_candidates, select_trades
+
+BINANCE = "https://fapi.binance.com/fapi/v1/klines"
+BINGX = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
+SOURCE = "auto"  # auto: BingX para TradFi (NC...-USDT) y símbolos con guion; Binance para el resto
+
+
+def use_bingx(symbol):
+    return SOURCE == "bingx" or (SOURCE == "auto" and "-" in symbol)
+
+
+def _get_bingx(symbol, tf, end_ms):
+    r = requests.get(BINGX, params={"symbol": symbol, "interval": tf, "limit": 1440, "endTime": end_ms}, timeout=20)
+    r.raise_for_status()
+    out = []
+    for k in r.json().get("data") or []:
+        if isinstance(k, dict):
+            out.append([int(k["time"]), float(k["open"]), float(k["high"]), float(k["low"]), float(k["close"]),
+                        float(k.get("volume", 0))])
+        else:
+            out.append([int(k[0])] + [float(v) for v in k[1:6]])
+    return sorted(out)
+CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+
+
+def fetch(symbol, tf, start_ms, end_ms):
+    os.makedirs(CACHE, exist_ok=True)
+    path = os.path.join(CACHE, f"{'bx_' if use_bingx(symbol) else ''}{symbol}_{tf}_{start_ms // 86400000}_{end_ms // 3600000}.csv")
+    if os.path.exists(path):
+        with open(path) as f:
+            return [[int(x[0])] + [float(v) for v in x[1:]] for x in (l.strip().split(",") for l in f) if x[0]]
+    rows, cur = [], start_ms
+    if use_bingx(symbol):  # BingX pagina hacia atrás con endTime
+        end = end_ms
+        while end > start_ms:
+            chunk = [k for k in _get_bingx(symbol, tf, end) if k[0] >= start_ms]
+            if not chunk or chunk[0][0] >= end:
+                break
+            rows = chunk + rows
+            end = chunk[0][0] - 1
+            time.sleep(0.15)
+        rows.sort()
+        cur = end_ms
+    while cur < end_ms:
+        r = requests.get(BINANCE, params={"symbol": symbol, "interval": tf, "startTime": cur, "endTime": end_ms,
+                                          "limit": 1500}, timeout=20)
+        r.raise_for_status()
+        k = r.json()
+        if not k:
+            break
+        rows += [[int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in k]
+        cur = k[-1][0] + 1
+        time.sleep(0.15)
+    out, seen = [], set()
+    for x in rows:
+        if x[0] not in seen:
+            seen.add(x[0])
+            out.append(x)
+    with open(path, "w") as f:
+        f.write("\n".join(",".join(str(v) for v in x) for x in out))
+    return out
+
+
+def tick_of(rows):
+    dec = 0
+    for r in rows[-300:]:
+        for v in r[1:5]:
+            s = f"{v:.10f}".rstrip("0")
+            dec = max(dec, len(s.split(".")[1]) if "." in s else 0)
+    return 10 ** (-min(dec, 8))
+
+
+def htf_ema_series(rows, n, ms):
+    out, e, closes, k = [], None, [], 2.0 / (n + 1)
+    for t, o, h, l, c, v in rows:
+        closes.append(c)
+        if len(closes) == n:
+            e = sum(closes) / n
+        elif len(closes) > n:
+            e = c * k + e * (1 - k)
+        out.append((t + ms, e if e is not None else float("nan")))
+    return out
+
+
+def load_symbol(sym, tf, days, warmup, strict, cfg):
+    tf_s = C.tf_seconds(tf)
+    end = int(time.time() * 1000) // 3600000 * 3600000
+    start = end - days * 86400000 - warmup * tf_s * 1000
+    rows = [r for r in fetch(sym, tf, start, end) if r[0] + tf_s * 1000 <= end]
+    if len(rows) < warmup + 50:
+        print(f"{sym}: pocas velas ({len(rows)})")
+        return []
+    ema = None
+    if cfg.TREND_FILTER != "off":
+        ms = C.tf_seconds(cfg.TREND_TF) * 1000
+        ema = htf_ema_series(fetch(sym, cfg.TREND_TF, start - cfg.TREND_EMA * 4 * ms, end), cfg.TREND_EMA, ms)
+    ctx_rows, ctx_s = None, None
+    if cfg.CONTEXT_TF and C.tf_seconds(cfg.CONTEXT_TF) > tf_s:
+        ctx_s = C.tf_seconds(cfg.CONTEXT_TF)
+        ctx_rows = fetch(sym, cfg.CONTEXT_TF, start - C.CONTEXT_WARMUP * ctx_s * 1000, end)
+    from universe import is_tradfi
+    return scan_candidates(rows, tf_s, tick_of(rows), strict, cfg, warmup, ema, ctx_rows, ctx_s, sym,
+                           range_effort=is_tradfi(sym) and cfg.TRADFI_EFFORT == "rango")
+
+
+def metrics(rs):
+    n = len(rs)
+    if n == 0:
+        return {"n": 0, "wr": 0, "avg": 0, "tot": 0, "pf": 0, "t": 0, "dd": 0, "streak": 0}
+    gw, gl = sum(r for r in rs if r > 0), -sum(r for r in rs if r < 0)
+    mean = sum(rs) / n
+    sd = math.sqrt(sum((r - mean) ** 2 for r in rs) / (n - 1)) if n > 1 else 0
+    eq = peak = dd = 0.0
+    streak = worst = 0
+    for r in rs:
+        eq += r
+        peak = max(peak, eq)
+        dd = max(dd, peak - eq)
+        streak = streak + 1 if r <= 0 else 0
+        worst = max(worst, streak)
+    return {"n": n, "wr": sum(1 for r in rs if r > 0) * 100 / n, "avg": mean, "tot": sum(rs),
+            "pf": gw / gl if gl else float("inf"), "t": mean / (sd / math.sqrt(n)) if sd > 0 else 0,
+            "dd": dd, "streak": worst}
+
+
+def line(m):
+    return (f"{m['n']:>4} ops  {m['wr']:5.1f}%  media {m['avg']:+.3f}R  total {m['tot']:+7.2f}R  "
+            f"PF {m['pf']:.2f}  t {m['t']:+.2f}")
+
+
+def report(trades, n_tests):
+    if not trades:
+        print("\nSin operaciones. Prueba más días/símbolos, otro TF o exigencia Agresivo.")
+        return
+    trades.sort(key=lambda x: x["open_t"])
+    m = metrics([x["r"] for x in trades])
+    print("\n══════ RESULTADO ══════")
+    print("TOTAL        " + line(m) + f"  peor racha {m['streak']}  DD {m['dd']:.2f}R")
+    cut = int(len(trades) * 0.7)
+    if len(trades) >= 20:
+        a, b = metrics([x["r"] for x in trades[:cut]]), metrics([x["r"] for x in trades[cut:]])
+        print("primer 70%   " + line(a))
+        print("último 30%   " + line(b))
+        if a["avg"] > 0 >= b["avg"]:
+            print("  ⚠ gana en la primera parte y pierde en la última: firma típica del sobreajuste o del cambio de régimen")
+    crit = NormalDist().inv_cdf(1 - 0.025 / max(n_tests, 1))
+    verdict = ("pasa el umbral de data-snooping (t≥3)" if m["t"] >= 3 else
+               "solo el umbral clásico (t≥2)" if m["t"] >= 2 else "NO distinguible de cero")
+    print(f"t {m['t']:+.2f} → {verdict} · Bonferroni con {n_tests} pruebas: {crit:.2f} "
+          f"({'pasa' if m['t'] >= crit else 'no pasa'})")
+    groups = defaultdict(lambda: defaultdict(list))
+    for x in trades:
+        groups["lado"][x["side"]].append(x["r"])
+        groups["tipo de entrada"][x["kind"]].append(x["r"])
+        groups["contexto " + (C.CONTEXT_TF or "-")][x.get("ctx_align", "-")].append(x["r"])
+        groups["EMA " + C.TREND_TF]["en contra" if x.get("against_trend") else "a favor/neutral"].append(x["r"])
+        groups["mes"][datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc).strftime("%Y-%m")].append(x["r"])
+        groups["símbolo"][x["symbol"]].append(x["r"])
+    for g, d in groups.items():
+        print(f"\n— por {g} —")
+        for k in sorted(d):
+            print(f"  {str(k):<16} " + line(metrics(d[k])))
+    if m["n"] < 30:
+        print(f"\n⚠ {m['n']} operaciones: un dibujo, no evidencia.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")
+    ap.add_argument("--tf", default=C.TIMEFRAME)
+    ap.add_argument("--days", type=int, default=180)
+    ap.add_argument("--warmup", type=int, default=400)
+    ap.add_argument("--strict", default=C.ENTRY_STRICTNESS)
+    ap.add_argument("--trend", default=C.TREND_FILTER, help="off | aviso | bloquea")
+    ap.add_argument("--context-tf", default=C.CONTEXT_TF)
+    ap.add_argument("--context-filter", default=C.CONTEXT_FILTER, help="off | aviso | bloquea")
+    ap.add_argument("--min-rr", type=float, default=C.MIN_RR)
+    ap.add_argument("--source", default="auto", help="auto | binance | bingx (TradFi: usa BingX, p. ej. NCFXEUR2USD-USDT)")
+    args = ap.parse_args()
+    C.TREND_FILTER, C.CONTEXT_TF, C.CONTEXT_FILTER, C.MIN_RR = args.trend, args.context_tf, args.context_filter, args.min_rr
+    global SOURCE
+    SOURCE = args.source
+    syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if SOURCE == "binance":
+        syms = [s.replace("-", "") for s in syms]
+    elif SOURCE == "bingx":
+        syms = [s if "-" in s else s.replace("USDT", "-USDT") for s in syms]
+    print(f"Backtest {args.tf} · {args.days} días · exigencia {args.strict} · EMA {C.TREND_FILTER} · "
+          f"contexto {C.CONTEXT_TF or '-'} {C.CONTEXT_FILTER} · R:R≥{C.MIN_RR} · coste {C.FEE_PCT}+{C.SLIPPAGE_PCT}%/lado")
+    trades = []
+    for s in syms:
+        try:
+            cands = load_symbol(s, args.tf, args.days, args.warmup, args.strict, C)
+        except requests.RequestException as e:
+            print(f"{s}: error de datos {e}")
+            continue
+        tr = select_trades(cands, C)
+        print(f"{s:<14} {len(cands):>3} entradas del motor → {len(tr):>3} operadas  {sum(x['r'] for x in tr):+.2f}R")
+        trades += tr
+    report(trades, len(syms))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
