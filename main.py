@@ -174,6 +174,8 @@ class Bot:
         for s in list(self.state["positions"]) + list(self.state["sims"]):
             if s not in syms and s in self.ex.contracts:
                 syms.append(s)  # no abandonar lo que está abierto
+        if C.CONTEXT_TF and "BTC-USDT" in self.ex.contracts and "BTC-USDT" not in syms and "crypto" in C.CATEGORIES:
+            syms.append("BTC-USDT")  # contexto de BTC para las señales de alts
         jobs = [(s, tf) for s in syms for tf in ALL_TFS if (s, tf) not in self.engines]
         self.warmup_many(jobs)
         for key in list(self.engines):
@@ -241,10 +243,31 @@ class Bot:
         eng = self.engines.get((sym, C.CONTEXT_TF))
         return context_of(eng.last if eng else None)
 
+    def btc_context(self, sym, tf):
+        if sym == "BTC-USDT" or not C.CONTEXT_TF or C.tf_seconds(C.CONTEXT_TF) <= C.tf_seconds(tf):
+            return 0, "-"
+        eng = self.engines.get(("BTC-USDT", C.CONTEXT_TF))
+        return context_of(eng.last if eng else None) if eng else (0, "-")
+
+    def funding(self, sym):
+        """Registro (no filtro): quién paga el funding en el momento de la señal = qué lado está amontonado."""
+        try:
+            fr = self.ex.funding_rate(sym)
+        except Exception as e:  # es solo registro: nunca debe impedir la señal
+            log.debug("funding %s: %s", sym, e)
+            return None, ""
+        if fr is None:
+            return None, ""
+        pct = fr * 100
+        tag = "largos amontonados" if pct >= 0.03 else "cortos amontonados" if pct <= -0.03 else "neutro"
+        return round(pct, 4), f"{pct:+.4f}%/8h ({tag})"
+
     # ── cierre de velas ──
     def process_tf(self, tf):
         cut, ms = now_ms(), tf_ms(tf)
-        syms = [s for s in self.symbols if (s, tf) in self.engines]
+        # primero los símbolos con estructura en Fase C/D: son los que pueden dar entrada en esta vela
+        syms = sorted((s for s in self.symbols if (s, tf) in self.engines),
+                      key=lambda s: 0 if (self.engines[(s, tf)].last or {}).get("phase", 0) in (PHASE_C, PHASE_D) else 1)
 
         def fetch(sym):
             try:
@@ -270,7 +293,8 @@ class Bot:
                     continue  # mercado cerrado (TradFi): no alimenta al motor
                 d = eng.update(t, o, h, l, c, v)
                 if trading:
-                    self.step_sim(sym, tf, t, h, l)
+                    self.step_sim(sym, tf, t, h, l, c, d["atr"])
+                    self.manage_bar(sym, tf, c, d["atr"])
             if d is None or not trading:
                 continue
             note = self.event_note(d)
@@ -308,12 +332,21 @@ class Bot:
         sig["trend"] = self.trend(sym, sig["entry"])
         cdir, clabel = self.context(sym, tf)
         sig["ctx_label"] = clabel
-        why = filters(sig, C, sig["trend"], alignment(sig["side"], cdir))
+        cinfo = self.ex.contracts[sym]
+        bdir, blabel = self.btc_context(sym, tf) if cinfo["cls"] == "crypto" else (0, "-")
+        sig["btc_label"] = blabel
+        sig["funding"], flabel = self.funding(sym)
+        why = filters(sig, C, sig["trend"], alignment(sig["side"], cdir),
+                      alignment(sig["side"], bdir) if blabel != "-" else "neutral")
+        if C.MAX_SAME_SIDE > 0:
+            book = self.state["positions"] if C.LIVE else self.state["sims"]
+            same = sum(1 for r in book.values() if r.get("side") == sig["side"])
+            if same >= C.MAX_SAME_SIDE:
+                why.append(f"ya hay {same} {sig['side']} abiertas (MAX_SAME_SIDE): en un desplome las alts se mueven como una")
         if self.state["paused"]:
             why.append("bot en pausa (/reanudar)")
         if sym in self.state["sims"] or sym in self.state["positions"]:
             why.append("ya hay una operación en este símbolo")
-        cinfo = self.ex.contracts[sym]
         if cinfo["cls"] != "crypto":
             if friday_cutoff():
                 why.append(f"TradFi en viernes ≥{C.TRADFI_NO_ENTRY_FRI_UTC}h UTC: el SL no se ejecuta con el mercado cerrado")
@@ -329,6 +362,9 @@ class Bot:
                f"TP1 {self.fp(sig['tp1'], sym)} · TP2 {self.fp(sig['tp2'], sym)} · R:R {sig['rr']:.2f}\n"
                f"Rango {self.fp(sig['rl'], sym)} – {self.fp(sig['rh'], sym)} · madurez {sig['conf']} · validación {sig['val']}\n"
                f"{ctx_icon} Contexto {C.CONTEXT_TF or '-'}: {clabel} ({sig['ctx_align']})"
+               + (f"\n{ {'a favor': '✅', 'en contra': '⚠', 'neutral': '·'}[sig['btc_align']] } BTC {C.CONTEXT_TF}: {blabel} ({sig['btc_align']})"
+                  if blabel != "-" else "")
+               + (f"\n💸 Funding {flabel}" if flabel else "")
                + (f"\n⚠ contra EMA{C.TREND_EMA} {C.TREND_TF}" if sig.get("against_trend") else ""))
         if why:
             self.tg.send(txt + "\n⏸ <i>No se abre: " + "; ".join(dict.fromkeys(why)) + "</i>")
@@ -340,21 +376,23 @@ class Bot:
             return
         self.open_live(sym, sig, txt)
 
-    def step_sim(self, sym, tf, t, h, l):
+    def step_sim(self, sym, tf, t, h, l, c, atr):
         s = self.state["sims"].get(sym)
         if not s or s.get("tf") != tf or t <= s["bar_t"]:
             return
-        sim = TradeSim(s, 0, C.FEE_PCT + C.SLIPPAGE_PCT, C.TP1_FRACTION, C.MOVE_SL_TO_BE)
+        sim = TradeSim(s, 0, C.FEE_PCT + C.SLIPPAGE_PCT, C.TP1_FRACTION, C.MOVE_SL_TO_BE, C.TRAIL_ATR, C.TIME_STOP_BARS)
         sim.half = s["half"]
-        if s["half"] and C.MOVE_SL_TO_BE:
-            sim.s = s["entry"]
-        r = sim.step(1, h, l)
+        sim.s = s.get("stop_now", s["entry"] if (s["half"] and C.MOVE_SL_TO_BE) else s["sl"])
+        s["nbars"] = s.get("nbars", 0) + 1
+        r = sim.step(s["nbars"], h, l, c, atr)
+        s["stop_now"] = sim.s
         if sim.half and not s["half"]:
             s["half"] = True
             self.tg.send(f"🎯 Virtual {sym} TP1 tocado" + (" · SL a breakeven" if C.MOVE_SL_TO_BE else ""))
         if r is None:
             self.save_state()
             return
+        s["exit_reason"] = sim.reason
         del self.state["sims"][sym]
         self.register_result(r)
         self.journal.write({"open_time": iso(s["open_ts"]), "close_time": iso(time.time()), "symbol": sym,
@@ -363,8 +401,10 @@ class Bot:
                             "rr_plan": round(s["rr"], 2), "r_net": round(r, 3),
                             "minutes": round((time.time() - s["open_ts"]) / 60), "conf": s["conf"], "val": s["val"],
                             "against_trend": s.get("against_trend"), "ctx_align": s.get("ctx_align"),
-                            "ctx_label": s.get("ctx_label"), "mode": "SIGNAL"})
-        self.tg.send(f"{'✅' if r > 0 else '❌'} Virtual {s['side']} {sym} cerrada: {r:+.2f}R "
+                            "ctx_label": s.get("ctx_label"), "btc_align": s.get("btc_align"),
+                            "funding": s.get("funding"), "range_atr": s.get("range_atr"), "b_bars": s.get("b_bars"),
+                            "exit_reason": sim.reason, "mode": "SIGNAL"})
+        self.tg.send(f"{'✅' if r > 0 else '❌'} Virtual {s['side']} {sym} cerrada por {sim.reason}: {r:+.2f}R "
                      f"(hoy {self.state['daily']['r']:+.2f}R · total {self.state['stats']['sum_r']:+.2f}R)")
 
     # ── LIVE ──
@@ -462,6 +502,39 @@ class Bot:
         self.tg.send(txt + f"\n✅ <b>LIVE</b> abierta {amt} @ {self.fp(entry, sym)} (desliz. {slip:+.3f}%)"
                      + (" · SL en la orden" if self.attach_ok else ""))
 
+    def manage_bar(self, sym, tf, c, atr):
+        """Al cierre de cada vela del TF de la posición: salida por tiempo y trailing tras TP1 (si están activos)."""
+        rec = self.state["positions"].get(sym)
+        if not C.LIVE or not rec or rec.get("tf") != tf:
+            return
+        rec["nbars"] = rec.get("nbars", 0) + 1
+        long = rec["side"] == "LONG"
+        d = 1 if long else -1
+        try:
+            pos = self.find_pos(sym, long)
+        except BingXError:
+            return
+        if pos is None:
+            return  # el ciclo de gestión registrará el cierre
+        amt = abs(float(pos["positionAmt"]))
+        if C.TIME_STOP_BARS and not rec.get("half") and rec["nbars"] >= C.TIME_STOP_BARS:
+            try:
+                self.ex.market_close(sym, long, amt)
+                rec["force_reason"] = "tiempo"
+                self.tg.send(f"⏱ {sym}: {rec['nbars']} velas sin tocar TP1 → cierre por tiempo")
+            except BingXError as e:
+                self.tg.send(f"⚠ {sym}: no se pudo cerrar por tiempo ({e})")
+            return
+        if C.TRAIL_ATR > 0 and rec.get("half") and atr == atr:
+            cur = rec.get("trail_stop") or (rec["entry_real"] if rec["be"] else rec["sl"])
+            new = self.ex.fmt_px(sym, c - d * C.TRAIL_ATR * atr)
+            if (new - cur) * d > self.ex.contracts[sym]["tick"]:
+                for o in self._stops(sym, long):
+                    self.ex.cancel(sym, o.get("orderId"))
+                rec["trail_stop"], rec["sl_id"] = new, ""
+                self.ensure_sl(sym, rec, amt, quiet=True)
+                self.save_state()
+
     def ensure_sl(self, sym, rec, amt, at_open=False, quiet=False):
         """Garantiza que la posición tiene stop. Si no lo tiene, lo pone; si no puede, cierra (al abrir) o avisa."""
         long = rec["side"] == "LONG"
@@ -473,13 +546,19 @@ class Bot:
         if stops:
             rec["sl_id"] = str(stops[0].get("orderId", rec.get("sl_id", "")))
             return True
-        level = rec["entry_real"] if rec["be"] else rec["sl"]
+        level = rec.get("trail_stop") or (rec["entry_real"] if rec["be"] else rec["sl"])
         try:
             rec["sl_id"] = self.ex.exit_order(sym, long, "STOP_MARKET", amt, level)
             if not at_open and not quiet:
                 self.tg.send(f"🛡 {sym}: faltaba el stop y se ha repuesto en {self.fp(level, sym)}")
             return True
         except BingXError as e:
+            if str(e).startswith("red"):  # sin respuesta: puede que el stop sí se creara
+                time.sleep(2)
+                again = self._stops(sym, long)
+                if again:
+                    rec["sl_id"] = str(again[0].get("orderId", ""))
+                    return True
             if at_open:
                 try:
                     self.ex.market_close(sym, long, amt)
@@ -562,13 +641,13 @@ class Bot:
         if px_tp2:
             exit_px, reason = px_tp2, "TP2"
         elif px_sl:
-            exit_px, reason = px_sl, "BE" if rec.get("be") else "SL"
+            exit_px, reason = px_sl, ("trailing" if rec.get("trail_stop") else "BE" if rec.get("be") else "SL")
         else:
             try:
                 exit_px = ex.price(sym)
             except BingXError:
                 exit_px = e
-            reason = "externo/manual"
+            reason = rec.get("force_reason", "externo/manual")
         r_exit = (exit_px - e) * d / risk
         r = (f * r1 + (1 - f) * r_exit) if rec.get("half") else r_exit
         r -= 2.0 * C.FEE_PCT / 100.0 * e / risk
@@ -590,7 +669,9 @@ class Bot:
                             "sl": rec["sl"], "tp1": rec["tp1"], "tp2": rec["tp2"], "rr_plan": round(rec["rr"], 2),
                             "qty": rec["qty"], "exit_reason": reason, "r_net": round(r, 3), "minutes": round(mins),
                             "conf": rec["conf"], "val": rec["val"], "against_trend": rec.get("against_trend"),
-                            "ctx_align": rec.get("ctx_align"), "ctx_label": rec.get("ctx_label"), "mode": "LIVE"})
+                            "ctx_align": rec.get("ctx_align"), "ctx_label": rec.get("ctx_label"),
+                            "btc_align": rec.get("btc_align"), "funding": rec.get("funding"),
+                            "range_atr": rec.get("range_atr"), "b_bars": rec.get("b_bars"), "mode": "LIVE"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} {rec['side']} {sym} cerrada por {reason}: {r:+.2f}R "
                      f"en {mins:.0f} min (hoy {self.state['daily']['r']:+.2f}R)")
 

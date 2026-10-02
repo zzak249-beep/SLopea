@@ -20,6 +20,18 @@ class Telegram:
         log.info("TG | %s", text.replace("\n", " | "))
         if not self.ok:
             return
+        # mensajes largos (universo de cientos de símbolos) se trocean por líneas en vez de cortarse
+        chunks, cur = [], ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 3900 and cur:
+                chunks.append(cur)
+                cur = ""
+            cur = f"{cur}\n{line}" if cur else line[:3900]
+        chunks.append(cur)
+        for ch in chunks:
+            self._send_one(ch)
+
+    def _send_one(self, text):
         for attempt in range(3):
             try:
                 r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
@@ -58,7 +70,7 @@ class Telegram:
 class Journal:
     FIELDS = ["open_time", "close_time", "symbol", "tf", "side", "kind", "entry_expected", "entry_real", "slippage_pct",
               "sl", "tp1", "tp2", "rr_plan", "qty", "exit_reason", "r_net", "minutes", "conf", "val",
-              "against_trend", "ctx_align", "ctx_label", "mode"]
+              "against_trend", "ctx_align", "ctx_label", "btc_align", "funding", "range_atr", "b_bars", "mode"]
 
     def __init__(self, data_dir):
         self.path = os.path.join(data_dir, "journal.csv")

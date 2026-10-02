@@ -68,7 +68,9 @@ class BingX:
                     r = self.http.request(method, f"{url}?{qs}" if qs else url, timeout=15)
                 j = r.json()
             except (requests.RequestException, ValueError) as e:
-                if attempt == retries - 1:
+                # un POST que se queda sin respuesta puede haberse ejecutado: reintentarlo a ciegas duplicaría
+                # la orden. Se devuelve el error y quien llama comprueba con order_exists().
+                if method == "POST" or attempt == retries - 1:
                     raise BingXError(f"red: {e}")
                 time.sleep(1.5 * (attempt + 1))
                 continue
@@ -109,6 +111,13 @@ class BingX:
     def price(self, symbol):
         d = self._req("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
         return float(d["price"])
+
+    def funding_rate(self, symbol):
+        d = self._req("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        v = d.get("lastFundingRate")
+        return None if v in (None, "") else float(v)
 
     def klines(self, symbol, interval, limit=1000, end_time=None):
         """Velas ordenadas de antigua a reciente: [t, o, h, l, c, v]. Incluye la vela en formación."""

@@ -105,7 +105,26 @@ def htf_ema_series(rows, n, ms):
     return out
 
 
-def load_symbol(sym, tf, days, warmup, strict, cfg):
+_BTC_CACHE = {}
+
+
+def btc_rows(cfg, start, end):
+    """Velas de BTC en CONTEXT_TF (una sola descarga por ejecución) para el contexto 'estructura de BTC'."""
+    if not cfg.CONTEXT_TF:
+        return None
+    key = (cfg.CONTEXT_TF, start, end)
+    if key not in _BTC_CACHE:
+        ms = C.tf_seconds(cfg.CONTEXT_TF) * 1000
+        sym = "BTC-USDT" if SOURCE == "bingx" else "BTCUSDT"
+        try:
+            _BTC_CACHE[key] = fetch(sym, cfg.CONTEXT_TF, start - C.CONTEXT_WARMUP * ms, end)
+        except requests.RequestException as e:
+            print(f"BTC contexto: {e}")
+            _BTC_CACHE[key] = None
+    return _BTC_CACHE[key]
+
+
+def load_symbol(sym, tf, days, warmup, strict, cfg, exits=None):
     tf_s = C.tf_seconds(tf)
     end = int(time.time() * 1000) // 3600000 * 3600000
     start = end - days * 86400000 - warmup * tf_s * 1000
@@ -122,8 +141,17 @@ def load_symbol(sym, tf, days, warmup, strict, cfg):
         ctx_s = C.tf_seconds(cfg.CONTEXT_TF)
         ctx_rows = fetch(sym, cfg.CONTEXT_TF, start - C.CONTEXT_WARMUP * ctx_s * 1000, end)
     from universe import is_tradfi
+    tradfi = is_tradfi(sym)
+    btc = None if (tradfi or sym.replace("-", "").startswith("BTCUSDT") or not ctx_s) else btc_rows(cfg, start, end)
     return scan_candidates(rows, tf_s, tick_of(rows), strict, cfg, warmup, ema, ctx_rows, ctx_s, sym,
-                           range_effort=is_tradfi(sym) and cfg.TRADFI_EFFORT == "rango")
+                           range_effort=tradfi and cfg.TRADFI_EFFORT == "rango", btc_rows=btc, exits=exits)
+
+
+def bucket(x, edges, labels):
+    for e, lab in zip(edges, labels):
+        if x < e:
+            return lab
+    return labels[-1]
 
 
 def metrics(rs):
@@ -177,6 +205,12 @@ def report(trades, n_tests):
         groups["tipo de entrada"][x["kind"]].append(x["r"])
         groups["contexto " + (C.CONTEXT_TF or "-")][x.get("ctx_align", "-")].append(x["r"])
         groups["EMA " + C.TREND_TF]["en contra" if x.get("against_trend") else "a favor/neutral"].append(x["r"])
+        groups["BTC " + (C.CONTEXT_TF or "-")][x.get("btc_align", "-")].append(x["r"])
+        groups["cómo cerró"][x.get("reason", "-")].append(x["r"])
+        groups["validación del indicador"][bucket(x["val"], (70, 85), ("<70", "70-84", "85+"))].append(x["r"])
+        groups["R:R del plan"][bucket(x["rr"], (1.5, 2.5, 4), ("<1.5", "1.5-2.5", "2.5-4", "4+"))].append(x["r"])
+        groups["altura del rango (ATR)"][bucket(x.get("range_atr", 0), (3, 6), ("<3", "3-6", "6+"))].append(x["r"])
+        groups["duración Fase B (velas)"][bucket(x.get("b_bars", 0), (60, 150), ("<60", "60-149", "150+"))].append(x["r"])
         groups["mes"][datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc).strftime("%Y-%m")].append(x["r"])
         groups["símbolo"][x["symbol"]].append(x["r"])
     for g, d in groups.items():
@@ -198,9 +232,14 @@ def main():
     ap.add_argument("--context-tf", default=C.CONTEXT_TF)
     ap.add_argument("--context-filter", default=C.CONTEXT_FILTER, help="off | aviso | bloquea")
     ap.add_argument("--min-rr", type=float, default=C.MIN_RR)
+    ap.add_argument("--tp2-mult", type=float, default=C.TP2_MULT)
+    ap.add_argument("--trail-atr", type=float, default=C.TRAIL_ATR)
+    ap.add_argument("--time-stop", type=int, default=C.TIME_STOP_BARS)
+    ap.add_argument("--btc-filter", default=C.BTC_FILTER, help="off | aviso | bloquea")
     ap.add_argument("--source", default="auto", help="auto | binance | bingx (TradFi: usa BingX, p. ej. NCFXEUR2USD-USDT)")
     args = ap.parse_args()
     C.TREND_FILTER, C.CONTEXT_TF, C.CONTEXT_FILTER, C.MIN_RR = args.trend, args.context_tf, args.context_filter, args.min_rr
+    C.TP2_MULT, C.TRAIL_ATR, C.TIME_STOP_BARS, C.BTC_FILTER = args.tp2_mult, args.trail_atr, args.time_stop, args.btc_filter
     global SOURCE
     SOURCE = args.source
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -209,7 +248,9 @@ def main():
     elif SOURCE == "bingx":
         syms = [s if "-" in s else s.replace("USDT", "-USDT") for s in syms]
     print(f"Backtest {args.tf} · {args.days} días · exigencia {args.strict} · EMA {C.TREND_FILTER} · "
-          f"contexto {C.CONTEXT_TF or '-'} {C.CONTEXT_FILTER} · R:R≥{C.MIN_RR} · coste {C.FEE_PCT}+{C.SLIPPAGE_PCT}%/lado")
+          f"contexto {C.CONTEXT_TF or '-'} {C.CONTEXT_FILTER} · BTC {C.BTC_FILTER} · R:R≥{C.MIN_RR}\n"
+          f"salida: TP2×{C.TP2_MULT} · trailing {C.TRAIL_ATR or 'off'} · tiempo {C.TIME_STOP_BARS or 'off'}"
+          f" · coste {C.FEE_PCT}+{C.SLIPPAGE_PCT}%/lado")
     trades = []
     for s in syms:
         try:

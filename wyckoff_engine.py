@@ -1276,6 +1276,7 @@ class WyckoffEngine:
             "rh": s.rangeHigh, "rl": s.rangeLow, "exc": s.exc, "excTested": s.excTested,
             "excP": s.excPrice, "testP": s.testPrice,
             "entry_now": entry_now, "entryKind": s.entryKind, "entryPrice": s.entryPrice, "entryTime": s.entryTime,
+            "range_atr": self.range_atr(s, a), "b_bars": (i - s.bStartBar) if not na(s.bStartBar) else 0,
         }
         return self.last
 

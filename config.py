@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 2.1.0 (2026-10-02)"
+CODE_VERSION = "wyckoff-bot 3.0.0 (2026-10-02)"
 
 
 def _raw(name, default):
@@ -93,6 +93,11 @@ CHASE_MAX_R = _f("CHASE_MAX_R", 0.5)             # no perseguir si el precio ya 
 MIN_RISK_DIST_PCT = _f("MIN_RISK_DIST_PCT", 0.30)  # stop demasiado cerca: el coste se come la R
 MAX_RISK_DIST_PCT = _f("MAX_RISK_DIST_PCT", 8.0)
 TP1_FRACTION = _f("TP1_FRACTION", 0.5)
+TP2_MULT = _f("TP2_MULT", 1.0)                  # TP2 = altura del rango × esto (1.0 = indicador)
+TRAIL_ATR = _f("TRAIL_ATR", 0.0)                # tras TP1, stop a cierre − X×ATR (0 = off, indicador)
+TIME_STOP_BARS = _i("TIME_STOP_BARS", 0)        # cierra si en N velas no toca TP1 (0 = off, indicador)
+BTC_FILTER = _s("BTC_FILTER", "aviso").lower()  # off | aviso | bloquea: estructura de BTC en CONTEXT_TF (solo cripto)
+MAX_SAME_SIDE = _i("MAX_SAME_SIDE", 0)          # máx. posiciones en la misma dirección (0 = sin tope)
 ATTACH_SL = _b("ATTACH_SL", True)               # SL dentro de la orden de entrada (sin ventana desnuda)
 MOVE_SL_TO_BE = _b("MOVE_SL_TO_BE", True)
 

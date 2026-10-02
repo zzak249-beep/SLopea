@@ -1,4 +1,4 @@
-# Wyckoff Bot v2.1 (BingX · Railway · Telegram)
+# Wyckoff Bot v3 (BingX · Railway · Telegram)
 
 Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El motor (`wyckoff_engine.py`) es una traducción 1:1 de `f_engine()` del Pine: mismas constantes, fases A→E, resets y lógica de entrada (una por campaña según exigencia).
 
@@ -36,6 +36,19 @@ Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El m
 - `BINGX_MAX_RPS` limita peticiones/segundo; con cientos de símbolos la vuelta tarda decenas de segundos.
 - Backtest de TradFi: `python backtest.py --symbols NCFXEUR2USD-USDT,NCCOGOLD2USD-USDT --tf 1h --days 180` (datos de BingX).
 
+## Ideas nuevas para probar (v3) — todas medibles, ninguna activada a ciegas
+| Idea | Variable | Por defecto | Cómo se mide |
+|---|---|---|---|
+| TP2 más lejos (altura × N) | `TP2_MULT` | 1.0 (indicador) | `sweep.py --modo salidas` |
+| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off | `sweep.py --modo salidas` |
+| Salida por tiempo si no llega a TP1 | `TIME_STOP_BARS` | 0 = off | `sweep.py --modo salidas` |
+| Estructura de BTC a favor/en contra | `BTC_FILTER` | aviso | desglose "por BTC" del backtest |
+| Funding en la señal (lado amontonado) | — | registro | columna `funding` del diario |
+| Tope de posiciones en la misma dirección | `MAX_SAME_SIDE` | 0 = sin tope | gestión de riesgo |
+| ¿Predice algo la validación del indicador? | — | — | desglose por validación, R:R, altura del rango y duración de Fase B |
+
+La gestión LIVE (trailing, tiempo, TP1→BE) se ha comprobado contra un mini-exchange que ejecuta las órdenes con el high/low de cada vela: da exactamente el mismo resultado que la simulación del backtest.
+
 ## Contexto de TF superior (`CONTEXT_TF`)
 Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en contra / neutral** según la estructura mayor, y va al diario y al backtest. `CONTEXT_FILTER=aviso` por defecto: se mide antes de usarlo para filtrar.
 
@@ -53,6 +66,7 @@ Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en co
 pip install requests
 python test_engine.py
 python backtest.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --tf 15m --days 180
-python sweep.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 240
+python sweep.py --modo entradas --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 240
+python sweep.py --modo salidas  --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 240
 ```
 Manda la columna de **prueba** del sweep, no la de entrenamiento.
