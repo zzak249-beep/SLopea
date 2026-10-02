@@ -8,7 +8,14 @@ Salidas configurables (para medir, no para creer):
   TRAIL_ATR  tras TP1, stop que persigue a cierre − TRAIL_ATR×ATR (0 = off, indicador)
   TIME_STOP  cierra a mercado si en N velas no ha tocado TP1 (0 = off, indicador)
 """
-from wyckoff_engine import (DIR_ACCUM, DIR_DIST, ENTRY_NAMES, PHASE_A, PHASE_NAMES, TYPE_NAMES, WyckoffEngine, na)
+import bisect
+import json
+import math
+
+from wyckoff_engine import (DIR_ACCUM, DIR_DIST, ENTRY_NAMES, PHASE_A, PHASE_C, PHASE_E, PHASE_NAMES, TYPE_NAMES,
+                            WyckoffEngine, na)
+
+FAIL_KIND = "Trampa (estructura rota)"
 
 
 def risk_plan(long, entry, rh, rl, exc, excP, testP, atr, sl_buffer_atr, tick, tp2_mult=1.0):
@@ -49,6 +56,176 @@ def build_signal(d, cfg, tick, tp2_mult=None):
         "conf": d["conf"], "val": d["val"], "time": d["time"], "risk_pct": abs(d["close"] - sl) / d["close"] * 100,
         "range_atr": round(d.get("range_atr", 0.0), 2), "b_bars": d.get("b_bars", 0),
     }
+
+
+def build_fail_signal(fail, close, atr, t, cfg, tick, tp2_mult=None):
+    """IDEA NUEVA — operar a los atrapados. La estructura estaba en Fase C/D con dirección decidida y el precio
+    cierra más allá del nivel duro (Spring/UTAD o clímax): quien compró el Spring tiene el stop justo debajo.
+    Entrada en contra de la estructura al cierre; stop de vuelta al otro lado del nivel duro (si el precio
+    recupera el nivel, la ruptura también ha fallado); TP2 = movimiento medido de la altura del rango."""
+    if not fail or na(fail.get("hard")) or na(fail.get("rh")) or na(fail.get("rl")) or na(atr):
+        return None
+    long = fail["side"] == "LONG"
+    m = cfg.TP2_MULT if tp2_mult is None else tp2_mult
+    hgt = max(fail["rh"] - fail["rl"], tick)
+    if long:
+        sl = fail["hard"] - cfg.FAIL_SL_ATR * atr
+        risk = close - sl
+        if risk <= tick:
+            return None
+        tp1 = close + risk
+        tp2 = max(fail["hard"] + hgt * m, close + 2 * risk)
+    else:
+        sl = fail["hard"] + cfg.FAIL_SL_ATR * atr
+        risk = sl - close
+        if risk <= tick:
+            return None
+        tp1 = close - risk
+        tp2 = min(fail["hard"] - hgt * m, close - 2 * risk)
+    return {"side": fail["side"], "entry": close, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": abs(tp2 - close) / risk,
+            "kind": FAIL_KIND, "rh": fail["rh"], "rl": fail["rl"], "atr": atr, "conf": fail["conf"],
+            "val": fail["val"], "time": t, "risk_pct": risk / close * 100,
+            "range_atr": round(fail["range_atr"], 2), "b_bars": fail["b_bars"], "had_entry": fail["had_entry"]}
+
+
+# ── IDEA NUEVA: flujo agresor (taker) en el Spring/UTAD ──
+def flow_features(side, rows_tail, exc_ts=None, n=10):
+    """rows_tail: velas [t,o,h,l,c,v,taker_buy] terminando en la vela de entrada.
+    flow     = (compra agresora − venta agresora) / volumen de las últimas n velas, con signo del lado
+               (+ = el flujo empuja a favor de la operación).
+    flow_exc = lo mismo en la vela del Spring/UTAD y la siguiente, con signo del lado. Wyckoff dice que
+               un Spring bueno es venta ABSORBIDA: venta agresora fuerte (flow_exc negativo) y aun así el
+               precio recupera. La otra lectura (flujo a favor confirma) también es posible: decide el backtest."""
+    if not rows_tail or len(rows_tail[-1]) < 7:
+        return None, None
+    d = 1 if side == "LONG" else -1
+
+    def norm(rs):
+        v = sum(r[5] for r in rs)
+        if v <= 0:
+            return None
+        return round(d * sum(2 * r[6] - r[5] for r in rs) / v, 4)
+
+    flow = norm(rows_tail[-n:])
+    flow_exc = None
+    if exc_ts is not None and not na(exc_ts):
+        for k, r in enumerate(rows_tail):
+            if r[0] == exc_ts:
+                flow_exc = norm(rows_tail[k:k + 2])
+                break
+    return flow, flow_exc
+
+
+# ── IDEA NUEVA: amplitud Wyckoff entre símbolos ──
+def wyckoff_state(d):
+    """+1 estructura alcista avanzada (Fase C-E acumulación), -1 bajista, 0 nada."""
+    if not d or d.get("phase", 0) < PHASE_C or d.get("phase", 0) > PHASE_E:
+        return 0
+    w = d.get("wdir", 0)
+    return 1 if w == DIR_ACCUM else -1 if w == DIR_DIST else 0
+
+
+def breadth_label(x):
+    if x is None:
+        return "-"
+    return "a favor" if x > 0.02 else "en contra" if x < -0.02 else "neutral"
+
+
+def apply_breadth(cands, timelines):
+    """timelines: {símbolo: (lista_t, lista_estado)}. Para cada señal: media del estado Wyckoff de los DEMÁS
+    símbolos en ese instante, con signo del lado. ¿Funciona mejor un Spring cuando medio mercado también acumula?"""
+    syms = list(timelines)
+    for c in cands:
+        tot = n = 0
+        for s in syms:
+            if s == c["symbol"]:
+                continue
+            ts, st = timelines[s]
+            k = bisect.bisect_right(ts, c["open_t"]) - 1
+            if k >= 0:
+                tot += st[k]
+                n += 1
+        if n == 0:
+            c["breadth"], c["breadth_align"] = None, "-"
+            continue
+        b = tot / n * (1 if c["side"] == "LONG" else -1)
+        c["breadth"], c["breadth_align"] = round(b, 4), breadth_label(b)
+
+
+# ── IDEA NUEVA: meta-etiquetado (un segundo modelo decide qué señales del indicador tomar) ──
+META_FEATURES = ("val", "conf", "rr", "range_atr", "log_b", "risk_pct", "ctx", "btc", "ema", "flow", "flow_exc",
+                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail")
+
+
+def _align_num(x):
+    return {"a favor": 1.0, "en contra": -1.0}.get(x, 0.0)
+
+
+def meta_features(c):
+    k = c.get("kind", "")
+    return {
+        "val": c.get("val"), "conf": c.get("conf"), "rr": min(c.get("rr", 0) or 0, 10),
+        "range_atr": c.get("range_atr"), "log_b": math.log1p(max(c.get("b_bars", 0) or 0, 0)),
+        "risk_pct": c.get("risk_pct"), "ctx": _align_num(c.get("ctx_align")), "btc": _align_num(c.get("btc_align")),
+        "ema": -1.0 if c.get("against_trend") else 0.0, "flow": c.get("flow"), "flow_exc": c.get("flow_exc"),
+        "breadth": c.get("breadth"), "long": 1.0 if c.get("side") == "LONG" else 0.0,
+        "kind_lps": 1.0 if "LPS" in k else 0.0, "kind_sos": 1.0 if "SOS" in k else 0.0,
+        "kind_fail": 1.0 if k == FAIL_KIND else 0.0,
+    }
+
+
+class MetaModel:
+    """Regresión logística con L2, en Python puro (sin numpy). Valores ausentes → media de entrenamiento."""
+
+    def __init__(self, feats=META_FEATURES):
+        self.feats = list(feats)
+        self.mean, self.std, self.w, self.b, self.thr = {}, {}, {}, 0.0, 0.5
+
+    def _x(self, c):
+        f = meta_features(c)
+        return [((f[k] if f[k] is not None else self.mean[k]) - self.mean[k]) / self.std[k] for k in self.feats]
+
+    def fit(self, cands, labels, l2=1.0, iters=600, lr=0.1):
+        for k in self.feats:
+            vals = [meta_features(c)[k] for c in cands]
+            vals = [v for v in vals if v is not None]
+            m = sum(vals) / len(vals) if vals else 0.0
+            sd = math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals)) if vals else 1.0
+            self.mean[k], self.std[k] = m, (sd if sd > 1e-9 else 1.0)
+        X = [self._x(c) for c in cands]
+        y = labels
+        n, p = len(X), len(self.feats)
+        w, b = [0.0] * p, 0.0
+        for _ in range(iters):
+            gw, gb = [0.0] * p, 0.0
+            for xi, yi in zip(X, y):
+                z = b + sum(wj * xj for wj, xj in zip(w, xi))
+                e = 1 / (1 + math.exp(-max(min(z, 30), -30))) - yi
+                gb += e
+                for j in range(p):
+                    gw[j] += e * xi[j]
+            b -= lr * gb / n
+            w = [wj - lr * (gj / n + l2 * wj / n) for wj, gj in zip(w, gw)]
+        self.w, self.b = dict(zip(self.feats, w)), b
+        return self
+
+    def prob(self, c):
+        z = self.b + sum(self.w[k] * x for k, x in zip(self.feats, self._x(c)))
+        return 1 / (1 + math.exp(-max(min(z, 30), -30)))
+
+    def save(self, path, info):
+        with open(path, "w") as f:
+            json.dump({"feats": self.feats, "mean": self.mean, "std": self.std, "w": self.w, "b": self.b,
+                       "thr": self.thr, "info": info}, f, indent=1)
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as f:
+            j = json.load(f)
+        m = cls(j["feats"])
+        m.mean, m.std, m.w, m.b, m.thr = j["mean"], j["std"], j["w"], j["b"], j["thr"]
+        m.info = j.get("info", {})
+        return m
 
 
 # ── tendencia HTF (EMA de la vela anterior ya cerrada, como el indicador v2) ──
@@ -162,6 +339,7 @@ class TradeSim:
 
 
 EXIT_KEYS = ("TP2_MULT", "TRAIL_ATR", "TIME_STOP_BARS")
+META = {"model": None}  # el backtest/bot cargan aquí el modelo si existe
 
 
 def exit_variant(cfg, **over):
@@ -172,7 +350,7 @@ def exit_variant(cfg, **over):
 
 
 def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_rows=None, ctx_tf_s=None,
-                    symbol="", range_effort=False, btc_rows=None, exits=None):
+                    symbol="", range_effort=False, btc_rows=None, exits=None, timeline=None):
     """Recorre las velas con el motor y devuelve TODAS las entradas que valida. Cada una lleva, por variante
     de salida, su resultado simulado de forma independiente (solo depende de los precios futuros) y sus
     etiquetas de filtro; el backtest aplica después filtros + "una posición a la vez" de forma exacta.
@@ -191,14 +369,18 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
         while e is not None and kk < len(rws) and rws[kk][0] + ctx_ms <= until:
             r = rws[kk]
             if not (r[5] <= 0 and r[2] == r[3]):
-                e.update(*r)
+                e.update(*r[:6])
             kk += 1
         return kk
 
-    for idx, (t, o, h, l, c, v) in enumerate(rows):
+    for idx, row in enumerate(rows):
+        t, o, h, l, c, v = row[:6]
         if v <= 0 and h == l:
             continue  # mercado cerrado (TradFi): igual que en el bot, no alimenta al motor
         d = eng.update(t, o, h, l, c, v)
+        if timeline is not None:
+            timeline[0].append(t + tf_ms)
+            timeline[1].append(wyckoff_state(d))
         still = []
         for cand, key, sim in opens:
             r = sim.step(idx, h, l, c, d["atr"])
@@ -213,11 +395,17 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
             j += 1
         k = feed(ctx, ctx_rows, k, bar_close)
         kb = feed(btc, btc_rows, kb, bar_close)
-        if idx < warmup or not d["entry_now"]:
+        if idx < warmup or not (d["entry_now"] or d["fail"]):
             continue
-        base = build_signal(d, cfg, tick, exits[0][0])
+        is_fail = not d["entry_now"]
+        mk = (lambda m: build_fail_signal(d["fail"], c, d["atr"], d["time"], cfg, tick, m)) if is_fail else \
+             (lambda m: build_signal(d, cfg, tick, m))
+        base = mk(exits[0][0])
         if base is None:
             continue
+        base["flow"], base["flow_exc"] = flow_features(
+            base["side"], rows[max(0, idx - 40):idx + 1],
+            None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"]))
         cdir, clabel = context_of(ctx.last if ctx is not None else None)
         bdir, blabel = context_of(btc.last if btc is not None else None)
         base.update(symbol=symbol, trend=trend_dir(c, ema), ctx_dir=cdir, ctx_label=clabel,
@@ -225,7 +413,7 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
                     btc_align=alignment(base["side"], bdir) if btc is not None else "neutral",
                     open_t=bar_close, res={}, rr_by={})
         for key in exits:
-            sig = build_signal(d, cfg, tick, key[0])
+            sig = mk(key[0])
             base["rr_by"][key] = sig["rr"]
             opens.append((base, key, TradeSim(sig, idx, cfg.FEE_PCT + cfg.SLIPPAGE_PCT, cfg.TP1_FRACTION,
                                               cfg.MOVE_SL_TO_BE, key[1], key[2])))
@@ -233,17 +421,30 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
     return cands
 
 
-def select_trades(cands, cfg, key=None):
+def select_trades(cands, cfg, key=None, which="main"):
     """Aplica filtros y 'una posición por símbolo a la vez' (greedy en orden temporal) para una variante
-    de salida. Devuelve copias con r / close_t / reason de esa variante."""
+    de salida. which: main = entradas del indicador (+ trampas si FAIL_TRADES=on) · fail = solo trampas.
+    Devuelve copias con r / close_t / reason de esa variante."""
     key = key or exit_variant(cfg)
     out, busy_until = [], {}
     for c in sorted(cands, key=lambda x: x["open_t"]):
+        is_fail = c["kind"] == FAIL_KIND
+        if which == "fail" and not is_fail:
+            continue
+        if which == "main" and is_fail and cfg.FAIL_TRADES != "on":
+            continue
+        if is_fail and cfg.FAIL_NEEDS_ENTRY and not c.get("had_entry"):
+            continue
         res = c["res"].get(key)
         if res is None:
             continue  # sigue abierta al final de los datos
         sig = dict(c, rr=c["rr_by"].get(key, c["rr"]))
         if filters(sig, cfg, c["trend"], c["ctx_align"], c.get("btc_align", "neutral")):
+            continue
+        if cfg.BREADTH_FILTER == "bloquea" and c.get("breadth_align") == "en contra":
+            continue
+        if cfg.META_FILTER == "bloquea" and META.get("model") is not None and \
+                META["model"].prob(c) < META["model"].thr:
             continue
         if c["open_t"] < busy_until.get(c["symbol"], 0):
             continue

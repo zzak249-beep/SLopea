@@ -21,7 +21,9 @@ from statistics import NormalDist
 import requests
 
 import config as C
-from strategy import scan_candidates, select_trades
+from strategy import FAIL_KIND, META, MetaModel, apply_breadth, scan_candidates, select_trades
+
+TIMELINES = {}
 
 BINANCE = "https://fapi.binance.com/fapi/v1/klines"
 BINGX = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
@@ -48,7 +50,7 @@ CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 def fetch(symbol, tf, start_ms, end_ms):
     os.makedirs(CACHE, exist_ok=True)
-    path = os.path.join(CACHE, f"{'bx_' if use_bingx(symbol) else ''}{symbol}_{tf}_{start_ms // 86400000}_{end_ms // 3600000}.csv")
+    path = os.path.join(CACHE, f"{'bx_' if use_bingx(symbol) else 'v4_'}{symbol}_{tf}_{start_ms // 86400000}_{end_ms // 3600000}.csv")
     if os.path.exists(path):
         with open(path) as f:
             return [[int(x[0])] + [float(v) for v in x[1:]] for x in (l.strip().split(",") for l in f) if x[0]]
@@ -71,7 +73,8 @@ def fetch(symbol, tf, start_ms, end_ms):
         k = r.json()
         if not k:
             break
-        rows += [[int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in k]
+        # col 9 de Binance = volumen comprado por agresores (taker buy): base del flujo de órdenes
+        rows += [[int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5]), float(x[9])] for x in k]
         cur = k[-1][0] + 1
         time.sleep(0.15)
     out, seen = [], set()
@@ -95,7 +98,7 @@ def tick_of(rows):
 
 def htf_ema_series(rows, n, ms):
     out, e, closes, k = [], None, [], 2.0 / (n + 1)
-    for t, o, h, l, c, v in rows:
+    for t, o, h, l, c, v, *_ in rows:
         closes.append(c)
         if len(closes) == n:
             e = sum(closes) / n
@@ -143,8 +146,15 @@ def load_symbol(sym, tf, days, warmup, strict, cfg, exits=None):
     from universe import is_tradfi
     tradfi = is_tradfi(sym)
     btc = None if (tradfi or sym.replace("-", "").startswith("BTCUSDT") or not ctx_s) else btc_rows(cfg, start, end)
-    return scan_candidates(rows, tf_s, tick_of(rows), strict, cfg, warmup, ema, ctx_rows, ctx_s, sym,
-                           range_effort=tradfi and cfg.TRADFI_EFFORT == "rango", btc_rows=btc, exits=exits)
+    tl = ([], [])
+    out = scan_candidates(rows, tf_s, tick_of(rows), strict, cfg, warmup, ema, ctx_rows, ctx_s, sym,
+                          range_effort=tradfi and cfg.TRADFI_EFFORT == "rango", btc_rows=btc, exits=exits, timeline=tl)
+    TIMELINES[sym] = tl
+    return out
+
+
+def bucket_n(x, edges, labels):
+    return "sin dato" if x is None else bucket(x, edges, labels)
 
 
 def bucket(x, edges, labels):
@@ -211,6 +221,9 @@ def report(trades, n_tests):
         groups["R:R del plan"][bucket(x["rr"], (1.5, 2.5, 4), ("<1.5", "1.5-2.5", "2.5-4", "4+"))].append(x["r"])
         groups["altura del rango (ATR)"][bucket(x.get("range_atr", 0), (3, 6), ("<3", "3-6", "6+"))].append(x["r"])
         groups["duración Fase B (velas)"][bucket(x.get("b_bars", 0), (60, 150), ("<60", "60-149", "150+"))].append(x["r"])
+        groups["flujo agresor últimas 10 velas"][bucket_n(x.get("flow"), (-0.05, 0.05), ("en contra", "neutro", "a favor"))].append(x["r"])
+        groups["flujo agresor en el Spring/UTAD"][bucket_n(x.get("flow_exc"), (-0.1, 0.1), ("venta/compra absorbida", "neutro", "a favor"))].append(x["r"])
+        groups["amplitud Wyckoff (resto de símbolos)"][x.get("breadth_align", "-")].append(x["r"])
         groups["mes"][datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc).strftime("%Y-%m")].append(x["r"])
         groups["símbolo"][x["symbol"]].append(x["r"])
     for g, d in groups.items():
@@ -236,10 +249,14 @@ def main():
     ap.add_argument("--trail-atr", type=float, default=C.TRAIL_ATR)
     ap.add_argument("--time-stop", type=int, default=C.TIME_STOP_BARS)
     ap.add_argument("--btc-filter", default=C.BTC_FILTER, help="off | aviso | bloquea")
+    ap.add_argument("--fail", default=C.FAIL_TRADES, help="off | aviso | on (incluir las trampas en el resultado)")
+    ap.add_argument("--breadth-filter", default=C.BREADTH_FILTER, help="off | aviso | bloquea")
+    ap.add_argument("--meta-filter", default="off", help="off | bloquea (aplica meta_model.json)")
     ap.add_argument("--source", default="auto", help="auto | binance | bingx (TradFi: usa BingX, p. ej. NCFXEUR2USD-USDT)")
     args = ap.parse_args()
     C.TREND_FILTER, C.CONTEXT_TF, C.CONTEXT_FILTER, C.MIN_RR = args.trend, args.context_tf, args.context_filter, args.min_rr
     C.TP2_MULT, C.TRAIL_ATR, C.TIME_STOP_BARS, C.BTC_FILTER = args.tp2_mult, args.trail_atr, args.time_stop, args.btc_filter
+    C.FAIL_TRADES, C.BREADTH_FILTER, C.META_FILTER = args.fail, args.breadth_filter, args.meta_filter
     global SOURCE
     SOURCE = args.source
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -251,17 +268,36 @@ def main():
           f"contexto {C.CONTEXT_TF or '-'} {C.CONTEXT_FILTER} · BTC {C.BTC_FILTER} · R:R≥{C.MIN_RR}\n"
           f"salida: TP2×{C.TP2_MULT} · trailing {C.TRAIL_ATR or 'off'} · tiempo {C.TIME_STOP_BARS or 'off'}"
           f" · coste {C.FEE_PCT}+{C.SLIPPAGE_PCT}%/lado")
-    trades = []
+    if C.META_FILTER == "bloquea" and os.path.exists(C.META_MODEL):
+        META["model"] = MetaModel.load(C.META_MODEL)
+        print(f"Meta-modelo {C.META_MODEL} activo (umbral {META['model'].thr:.2f}) — ojo: solo es honesto en datos posteriores a su entrenamiento")
+    allc = []
     for s in syms:
         try:
-            cands = load_symbol(s, args.tf, args.days, args.warmup, args.strict, C)
+            allc += load_symbol(s, args.tf, args.days, args.warmup, args.strict, C)
         except requests.RequestException as e:
             print(f"{s}: error de datos {e}")
-            continue
-        tr = select_trades(cands, C)
-        print(f"{s:<14} {len(cands):>3} entradas del motor → {len(tr):>3} operadas  {sum(x['r'] for x in tr):+.2f}R")
+    apply_breadth(allc, TIMELINES)  # necesita a todos los símbolos cargados
+    trades = []
+    for s in syms:
+        mine = [c for c in allc if c["symbol"] == s]
+        tr = select_trades(mine, C)
+        n_ent = sum(1 for c in mine if c["kind"] != FAIL_KIND)
+        print(f"{s:<14} {n_ent:>3} entradas del motor → {len(tr):>3} operadas  {sum(x['r'] for x in tr):+.2f}R")
         trades += tr
     report(trades, len(syms))
+    fails = select_trades(allc, C, which="fail")
+    print("\n══════ IDEA: TRAMPA (operar contra la estructura rota) ══════")
+    if FAIL_KIND in {t["kind"] for t in trades}:
+        print("(FAIL_TRADES=on: estas operaciones ya están incluidas arriba)")
+    if fails:
+        rs = [x["r"] for x in fails]
+        print("trampas       " + line(metrics(rs)))
+        withe = [x["r"] for x in fails if x.get("had_entry")]
+        if withe:
+            print("  ·con entrada " + line(metrics(withe)) + "  (la estructura llegó a dar señal y falló)")
+    else:
+        print("ninguna estructura rota en Fase C/D en el periodo")
 
 
 if __name__ == "__main__":

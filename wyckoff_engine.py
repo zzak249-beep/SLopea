@@ -771,6 +771,16 @@ class WyckoffEngine:
         if resetWhy < 0 and not probeOpen and not na(idleLim) and not na(s.lastActBar) and i - s.lastActBar > idleLim:
             resetWhy = RS_STALE
 
+        # Estructura que se rompe por el nivel duro estando en Fase C/D con dirección ya decidida:
+        # los que operaron el Spring/UTAD quedan atrapados. Se publica para la idea "trampa".
+        fail = None
+        if resetWhy == RS_INVALID and s.phase in (PHASE_C, PHASE_D) and s.outcome != DIR_NONE:
+            fail = {"side": "SHORT" if s.outcome == DIR_ACCUM else "LONG",
+                    "hard": hardBull0 if s.outcome == DIR_ACCUM else hardBear0,
+                    "rh": s.rangeHigh, "rl": s.rangeLow, "phase": s.phase, "had_entry": not na(s.entryTime),
+                    "conf": self.conf_ws(s), "val": self.validation_ws(s, p0, trendScore, a),
+                    "range_atr": self.range_atr(s, a),
+                    "b_bars": (i - s.bStartBar) if not na(s.bStartBar) else 0}
         if resetWhy >= 0:
             self.reset(resetWhy)
             s = self.s
@@ -1277,6 +1287,7 @@ class WyckoffEngine:
             "excP": s.excPrice, "testP": s.testPrice,
             "entry_now": entry_now, "entryKind": s.entryKind, "entryPrice": s.entryPrice, "entryTime": s.entryTime,
             "range_atr": self.range_atr(s, a), "b_bars": (i - s.bStartBar) if not na(s.bStartBar) else 0,
+            "excT": s.excTime, "testT": s.testTime, "fail": fail,
         }
         return self.last
 

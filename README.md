@@ -1,4 +1,4 @@
-# Wyckoff Bot v3 (BingX · Railway · Telegram)
+# Wyckoff Bot v4 (BingX · Railway · Telegram)
 
 Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El motor (`wyckoff_engine.py`) es una traducción 1:1 de `f_engine()` del Pine: mismas constantes, fases A→E, resets y lógica de entrada (una por campaña según exigencia).
 
@@ -14,6 +14,8 @@ Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El m
 | `universe.py` | Clasifica cada perpetuo: cripto, forex, materia prima, acción, índice |
 | `config.py` | Variables de entorno (quita comillas) |
 | `backtest.py` | Backtest con el mismo motor/filtros/gestión, coste incluido, partición 70/30 y desgloses |
+| `meta.py` | Meta-etiquetado: un 2º modelo aprende qué señales del indicador tomar (walk-forward, purga, prueba de azar) |
+| `research.py` | Servicio de investigación en Railway (`RUN_MODE=research`): backtest + sweep + meta con datos reales, resultados a Telegram |
 | `sweep.py` | Barrido de variantes: elige en el 70% inicial, enseña el 30% final, corrige por nº de pruebas |
 | `test_engine.py` | Prueba sin red con ciclos sintéticos |
 | `railway.env.txt` | Plantilla para el Raw Editor de Railway |
@@ -49,6 +51,16 @@ Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El m
 
 La gestión LIVE (trailing, tiempo, TP1→BE) se ha comprobado contra un mini-exchange que ejecuta las órdenes con el high/low de cada vela: da exactamente el mismo resultado que la simulación del backtest.
 
+## Ideas v4 — lo que casi nadie hace con Wyckoff (todo medible, nada activado a ciegas)
+| Idea | Variable | Por defecto | Dónde se mide |
+|---|---|---|---|
+| **Trampa**: cuando una estructura en Fase C/D se rompe por el nivel duro, operar en contra (los del Spring/UTAD quedan atrapados con el stop ahí) | `FAIL_TRADES` off/aviso/on, `FAIL_SL_ATR` | aviso | sección TRAMPA del backtest |
+| **Flujo agresor en el Spring**: compra/venta agresora (taker) de Binance en la vela del Spring/UTAD y en las 10 últimas. ¿Spring con venta absorbida o con compra a favor? | `FLOW_SOURCE` | binance | desgloses "flujo agresor" |
+| **Amplitud Wyckoff**: cuántos símbolos del universo están a la vez en acumulación/distribución avanzada | `BREADTH_FILTER` | aviso | desglose "amplitud Wyckoff" |
+| **Meta-etiquetado**: el indicador da la dirección; un modelo entrenado decide qué señales tomar | `META_FILTER`, `meta_model.json` | aviso | `python meta.py` |
+
+Binance bloquea IPs de EE. UU. (HTTP 451): para tener flujo agresor en vivo, pon el servicio de Railway en una región de Europa.
+
 ## Contexto de TF superior (`CONTEXT_TF`)
 Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en contra / neutral** según la estructura mayor, y va al diario y al backtest. `CONTEXT_FILTER=aviso` por defecto: se mide antes de usarlo para filtrar.
 
@@ -61,12 +73,20 @@ Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en co
 3. Volumen montado en `/data`.
 4. Arranca en `MODE=SIGNAL`. Para operar: `MODE=LIVE` **y** `CONFIRM_LIVE=SI`.
 
+## Investigación en Railway (sin ordenador)
+1. En el mismo proyecto: **New → GitHub Repo → el mismo repo del bot** (servicio nuevo, p. ej. `wyckoff-research`).
+2. Variables → Raw Editor → pega `railway.research.env.txt` (con tu token y chat de Telegram). Sin claves de BingX: no opera.
+3. Settings → región **Europa** (en EE. UU. Binance devuelve 451 y no hay flujo agresor; funciona igual con datos de BingX).
+4. Deploy. En 10-30 min llega a Telegram el resumen + el informe completo (+ `meta_model.json` solo si supera la prueba de azar).
+5. Al terminar queda en reposo. Para repetir con otros parámetros: cambia variables y Redeploy. Cuando acabes, borra el servicio.
+
 ## Antes de LIVE
 ```
 pip install requests
 python test_engine.py
-python backtest.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --tf 15m --days 180
-python sweep.py --modo entradas --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 240
-python sweep.py --modo salidas  --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 240
+python backtest.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 365
+python sweep.py --modo entradas --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 365
+python sweep.py --modo salidas  --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT --tf 15m --days 365
+python meta.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT --tf 15m --days 365 --incluir-trampas
 ```
-Manda la columna de **prueba** del sweep, no la de entrenamiento.
+Manda la columna de **prueba** del sweep y la **prueba de azar** de meta.py. `meta.py --guardar` solo si la prueba de azar da <5%.

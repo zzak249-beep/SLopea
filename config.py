@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 3.0.0 (2026-10-02)"
+CODE_VERSION = "wyckoff-bot 4.1.0 (2026-10-02)"
 
 
 def _raw(name, default):
@@ -98,6 +98,14 @@ TRAIL_ATR = _f("TRAIL_ATR", 0.0)                # tras TP1, stop a cierre − X�
 TIME_STOP_BARS = _i("TIME_STOP_BARS", 0)        # cierra si en N velas no toca TP1 (0 = off, indicador)
 BTC_FILTER = _s("BTC_FILTER", "aviso").lower()  # off | aviso | bloquea: estructura de BTC en CONTEXT_TF (solo cripto)
 MAX_SAME_SIDE = _i("MAX_SAME_SIDE", 0)          # máx. posiciones en la misma dirección (0 = sin tope)
+# ── v4: ideas nuevas ──
+FAIL_TRADES = _s("FAIL_TRADES", "aviso").lower()  # off | aviso | on: operar a los atrapados cuando la estructura se rompe
+FAIL_SL_ATR = _f("FAIL_SL_ATR", 1.0)              # stop de la trampa: nivel duro ± X×ATR
+FAIL_NEEDS_ENTRY = _b("FAIL_NEEDS_ENTRY", False)  # true = solo estructuras que llegaron a dar entrada
+FLOW_SOURCE = _s("FLOW_SOURCE", "binance").lower() # binance | off: compra/venta agresora (no hay en BingX)
+BREADTH_FILTER = _s("BREADTH_FILTER", "aviso").lower()  # off | aviso | bloquea: amplitud Wyckoff en contra
+META_MODEL = _s("META_MODEL", "meta_model.json")  # modelo entrenado con meta.py --guardar
+META_FILTER = _s("META_FILTER", "aviso").lower()  # off | aviso | bloquea (bloquea por debajo del umbral)
 ATTACH_SL = _b("ATTACH_SL", True)               # SL dentro de la orden de entrada (sin ventana desnuda)
 MOVE_SL_TO_BE = _b("MOVE_SL_TO_BE", True)
 

@@ -19,11 +19,14 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+import requests
+
 import config as C
 from bingx import BingX, BingXError
 from notify import Journal, Telegram
 from universe import is_tradfi
-from strategy import TradeSim, alignment, build_signal, context_of, ema_last, filters, trend_dir
+from strategy import (FAIL_KIND, MetaModel, TradeSim, alignment, breadth_label, build_fail_signal, build_signal,
+                      context_of, ema_last, filters, flow_features, trend_dir, wyckoff_state)
 from wyckoff_engine import (BIT_CTEST, BIT_SOS, BIT_SOW, BIT_SPRING, BIT_TEST, BIT_UTAD, DIR_ACCUM, PHASE_C,
                             PHASE_D, PHASE_NAMES, WyckoffEngine, has_bit)
 
@@ -75,8 +78,23 @@ class Bot:
         self.cooldown = {}
         self.running = True
         self.attach_ok = C.ATTACH_SL
+        self.flow_ok = C.FLOW_SOURCE == "binance"
+        self.meta = self.load_meta()
         self.state = self.load_state()
         self.last_status = time.time()
+
+    def load_meta(self):
+        if C.META_FILTER == "off":
+            return None
+        for path in (C.META_MODEL, os.path.join(C.DATA_DIR, os.path.basename(C.META_MODEL))):
+            if os.path.exists(path):
+                try:
+                    m = MetaModel.load(path)
+                    log.info("meta-modelo cargado de %s (umbral %.2f)", path, m.thr)
+                    return m
+                except (OSError, ValueError, KeyError) as e:
+                    log.warning("meta-modelo %s ilegible: %s", path, e)
+        return None
 
     def fp(self, x, sym):
         pp = self.ex.contracts.get(sym, {}).get("pp", 6)
@@ -243,6 +261,34 @@ class Bot:
         eng = self.engines.get((sym, C.CONTEXT_TF))
         return context_of(eng.last if eng else None)
 
+    def flow(self, sym, tf, side, exc_ts):
+        """Compra/venta agresora de Binance (BingX no la publica en sus velas). Solo cripto; solo registro/meta."""
+        if not self.flow_ok or self.ex.contracts.get(sym, {}).get("cls") != "crypto":
+            return None, None
+        try:
+            r = requests.get("https://fapi.binance.com/fapi/v1/klines",
+                             params={"symbol": sym.replace("-", ""), "interval": tf, "limit": 42}, timeout=8)
+            if r.status_code == 451:
+                self.flow_ok = False
+                self.tg.send("ℹ Binance bloquea esta región (HTTP 451): sin flujo agresor. Cambia la región del "
+                             "servicio en Railway a Europa para tenerlo.")
+                return None, None
+            if r.status_code != 200:
+                return None, None
+            ms = tf_ms(tf)
+            rows = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), float(k[9])]
+                    for k in r.json() if int(k[0]) + ms <= now_ms()]
+            return flow_features(side, rows, exc_ts)
+        except (requests.RequestException, ValueError, IndexError) as e:
+            log.debug("flujo %s: %s", sym, e)
+            return None, None
+
+    def breadth(self, sym, tf, side):
+        st = [wyckoff_state(e.last) for (s, t), e in self.engines.items() if t == tf and s != sym]
+        if not st:
+            return None
+        return round(sum(st) / len(st) * (1 if side == "LONG" else -1), 4)
+
     def btc_context(self, sym, tf):
         if sym == "BTC-USDT" or not C.CONTEXT_TF or C.tf_seconds(C.CONTEXT_TF) <= C.tf_seconds(tf):
             return 0, "-"
@@ -302,6 +348,8 @@ class Bot:
                 watch.append(f"{sym} {tf} {note}")
             if d["entry_now"] and d["time"] == fresh[-1][0]:
                 self.handle_entry(sym, tf, d)
+            elif d.get("fail") and d["time"] == fresh[-1][0] and C.FAIL_TRADES != "off":
+                self.handle_entry(sym, tf, d, fail=True)
         if rebuild:
             self.warmup_many(rebuild)
         if watch:
@@ -323,8 +371,9 @@ class Bot:
         return ""
 
     # ── señales ──
-    def handle_entry(self, sym, tf, d):
-        sig = build_signal(d, C, self.ex.contracts[sym]["tick"])
+    def handle_entry(self, sym, tf, d, fail=False):
+        tick = self.ex.contracts[sym]["tick"]
+        sig = build_fail_signal(d["fail"], d["close"], d["atr"], d["time"], C, tick) if fail else build_signal(d, C, tick)
         if sig is None or time.time() - self.cooldown.get(sym, 0) < C.SIGNAL_COOLDOWN_MIN * 60:
             return
         self.cooldown[sym] = time.time()
@@ -336,8 +385,19 @@ class Bot:
         bdir, blabel = self.btc_context(sym, tf) if cinfo["cls"] == "crypto" else (0, "-")
         sig["btc_label"] = blabel
         sig["funding"], flabel = self.funding(sym)
+        sig["flow"], sig["flow_exc"] = self.flow(sym, tf, sig["side"], None if fail else (
+            d["excT"] if d["excT"] == d["excT"] else d["testT"]))
+        sig["breadth"] = self.breadth(sym, tf, sig["side"])
+        sig["breadth_align"] = breadth_label(sig["breadth"])
         why = filters(sig, C, sig["trend"], alignment(sig["side"], cdir),
                       alignment(sig["side"], bdir) if blabel != "-" else "neutral")
+        sig["meta_p"] = round(self.meta.prob(sig), 3) if self.meta else None
+        if fail and C.FAIL_TRADES == "aviso":
+            why.append("FAIL_TRADES=aviso (solo aviso, se registra para medir)")
+        if C.BREADTH_FILTER == "bloquea" and sig["breadth_align"] == "en contra":
+            why.append("amplitud Wyckoff en contra")
+        if self.meta and C.META_FILTER == "bloquea" and sig["meta_p"] < self.meta.thr:
+            why.append(f"meta-modelo p={sig['meta_p']:.2f} < {self.meta.thr:.2f}")
         if C.MAX_SAME_SIDE > 0:
             book = self.state["positions"] if C.LIVE else self.state["sims"]
             same = sum(1 for r in book.values() if r.get("side") == sig["side"])
@@ -354,7 +414,7 @@ class Bot:
                 why.append("BingX tiene cerrada la apertura por API")
         if C.LIVE:
             why += self.live_blockers(sym)
-        icon = "🟢" if sig["side"] == "LONG" else "🔴"
+        icon = ("🪤" if fail else "") + ("🟢" if sig["side"] == "LONG" else "🔴")
         ctx_icon = {"a favor": "✅", "en contra": "⚠", "neutral": "·"}[sig["ctx_align"]]
         cls = "" if cinfo["cls"] == "crypto" else f" · {cinfo['cls_label']} {cinfo['name']}"
         txt = (f"{icon} <b>{sig['side']} {sym}</b>{cls} · {tf} · {sig['kind']}\n"
@@ -365,6 +425,13 @@ class Bot:
                + (f"\n{ {'a favor': '✅', 'en contra': '⚠', 'neutral': '·'}[sig['btc_align']] } BTC {C.CONTEXT_TF}: {blabel} ({sig['btc_align']})"
                   if blabel != "-" else "")
                + (f"\n💸 Funding {flabel}" if flabel else "")
+               + (f"\n🌊 Flujo agresor {sig['flow']:+.2f}" + (f" · en el Spring/UTAD {sig['flow_exc']:+.2f}"
+                                                              if sig["flow_exc"] is not None else "")
+                  if sig["flow"] is not None else "")
+               + (f"\n🧭 Amplitud Wyckoff {sig['breadth']:+.2f} ({sig['breadth_align']})" if sig["breadth"] is not None else "")
+               + (f"\n🧠 Meta-modelo p={sig['meta_p']:.2f} (umbral {self.meta.thr:.2f})" if sig["meta_p"] is not None else "")
+               + (f"\n🪤 Estructura rota: los del {'Spring' if sig['side'] == 'SHORT' else 'UTAD'} quedan atrapados"
+                  if fail else "")
                + (f"\n⚠ contra EMA{C.TREND_EMA} {C.TREND_TF}" if sig.get("against_trend") else ""))
         if why:
             self.tg.send(txt + "\n⏸ <i>No se abre: " + "; ".join(dict.fromkeys(why)) + "</i>")
@@ -403,6 +470,8 @@ class Bot:
                             "against_trend": s.get("against_trend"), "ctx_align": s.get("ctx_align"),
                             "ctx_label": s.get("ctx_label"), "btc_align": s.get("btc_align"),
                             "funding": s.get("funding"), "range_atr": s.get("range_atr"), "b_bars": s.get("b_bars"),
+                            "flow": s.get("flow"), "flow_exc": s.get("flow_exc"), "breadth": s.get("breadth"),
+                            "meta_p": s.get("meta_p"),
                             "exit_reason": sim.reason, "mode": "SIGNAL"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} Virtual {s['side']} {sym} cerrada por {sim.reason}: {r:+.2f}R "
                      f"(hoy {self.state['daily']['r']:+.2f}R · total {self.state['stats']['sum_r']:+.2f}R)")
@@ -671,7 +740,9 @@ class Bot:
                             "conf": rec["conf"], "val": rec["val"], "against_trend": rec.get("against_trend"),
                             "ctx_align": rec.get("ctx_align"), "ctx_label": rec.get("ctx_label"),
                             "btc_align": rec.get("btc_align"), "funding": rec.get("funding"),
-                            "range_atr": rec.get("range_atr"), "b_bars": rec.get("b_bars"), "mode": "LIVE"})
+                            "range_atr": rec.get("range_atr"), "b_bars": rec.get("b_bars"),
+                            "flow": rec.get("flow"), "flow_exc": rec.get("flow_exc"), "breadth": rec.get("breadth"),
+                            "meta_p": rec.get("meta_p"), "mode": "LIVE"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} {rec['side']} {sym} cerrada por {reason}: {r:+.2f}R "
                      f"en {mins:.0f} min (hoy {self.state['daily']['r']:+.2f}R)")
 
@@ -823,6 +894,10 @@ class Bot:
 
 
 def main():
+    if os.getenv("RUN_MODE", "").strip().strip('"').lower() == "research":
+        import research  # servicio de investigación: backtest + sweep + meta, resultados a Telegram
+        research.run()
+        return
     log.info("%s | %s", C.CODE_VERSION, C.summary())
     bot = Bot()
 

@@ -17,8 +17,8 @@ from statistics import NormalDist
 from types import SimpleNamespace
 
 import config as C
-from backtest import load_symbol, metrics
-from strategy import exit_variant, select_trades
+from backtest import TIMELINES, load_symbol, metrics
+from strategy import apply_breadth, exit_variant, select_trades
 
 
 def cfg_with(**kw):
@@ -66,6 +66,7 @@ def main():
         cands = {}
         for strict in ("Agresivo", "Estándar", "Conservador"):
             cands[strict] = [c for s in syms for c in load_symbol(s, args.tf, args.days, args.warmup, strict, scan_cfg)]
+            apply_breadth(cands[strict], TIMELINES)
             print(f"{strict}: {len(cands[strict])} entradas del motor")
         times = sorted(c["open_t"] for c in cands["Agresivo"]) or [0]
         cutoff = times[0] + (times[-1] - times[0]) * 0.7
@@ -82,6 +83,7 @@ def main():
                 for m, tr, ts in itertools.product((1.0, 1.5, 2.0), (0.0, 1.5, 3.0), (0, 32, 96))]
         cands = [c for s in syms for c in load_symbol(s, args.tf, args.days, args.warmup, C.ENTRY_STRICTNESS,
                                                       scan_cfg, exits=grid)]
+        apply_breadth(cands, TIMELINES)
         print(f"{C.ENTRY_STRICTNESS}: {len(cands)} entradas del motor · filtros de entrada los de config")
         times = sorted(c["open_t"] for c in cands) or [0]
         cutoff = times[0] + (times[-1] - times[0]) * 0.7
