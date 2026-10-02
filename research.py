@@ -101,6 +101,20 @@ def idle():
         time.sleep(3600)
 
 
+def summarize(block):
+    head = block.strip().splitlines()[0] if block.strip() else ""
+    keys = [ln.strip() for ln in block.splitlines() if KEY_LINES.search(ln.strip())]
+    return "\n".join([head] + keys[:16])
+
+
+def rss_mb():
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return 0.0
+
+
 def run():
     os.makedirs(C.DATA_DIR, exist_ok=True)
     syms = [s.strip().upper() for s in env("RESEARCH_SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
@@ -110,7 +124,8 @@ def run():
     strict = env("RESEARCH_STRICT", C.ENTRY_STRICTNESS)
     sig = hashlib.md5(f"{C.CODE_VERSION}|{syms}|{tf}|{days}|{steps}|{strict}".encode()).hexdigest()[:10]
     marker = os.path.join(C.DATA_DIR, f"research_done_{sig}")
-    if os.path.exists(marker) and env("RESEARCH_FORCE", "false").lower() not in ("true", "1", "si", "sí"):
+    force = env("RESEARCH_FORCE", "false").lower() in ("true", "1", "si", "sí")
+    if os.path.exists(marker) and not force:
         print("Investigación ya hecha con esta configuración; en reposo. RESEARCH_FORCE=true para repetir.")
         idle()
 
@@ -124,49 +139,54 @@ def run():
     B.SOURCE = source
     C.META_MODEL = os.path.join(C.DATA_DIR, "meta_model.json")
     sym_arg = ",".join(syms)
+    low_tf = C.tf_seconds(tf) < 3600
     t0 = time.time()
+
+    plan = {
+        "backtest": ("BACKTEST (configuración actual)", B.main,
+                     ["backtest", "--symbols", sym_arg, "--tf", tf, "--days", days, "--strict", strict,
+                      "--source", source]),
+        "entradas": ("SWEEP ENTRADAS", sweep.main,
+                     ["sweep", "--modo", "entradas", "--symbols", sym_arg, "--tf", tf, "--days", days]),
+        "salidas": ("SWEEP SALIDAS", sweep.main,
+                    ["sweep", "--modo", "salidas", "--symbols", sym_arg, "--tf", tf, "--days", days]),
+        "meta": ("META-ETIQUETADO", meta.main,
+                 ["meta", "--symbols", sym_arg, "--tf", tf, "--days", days, "--incluir-trampas", "--guardar-si-pasa"]),
+    }
+    # reanudación: cada paso terminado deja su informe en el volumen; si el contenedor se reinicia, se salta
+    done_path = lambda st: os.path.join(C.DATA_DIR, f"research_{sig}_{st}.txt")
+    pending = [st for st in steps if st in plan and (force or not os.path.exists(done_path(st)))]
     tg_text(f"🔬 Investigación Wyckoff · {C.CODE_VERSION}\n{len(syms)} símbolos · {tf} · {days} días · pasos: "
-            f"{', '.join(steps)}\nDatos: {source.upper()}"
-            + ("" if source == "binance" else "\n⚠ Binance bloquea esta región (EE. UU.): datos de BingX y SIN flujo "
-                                              "agresor. Para tenerlo, cambia la región del servicio a Europa.")
-            + "\nTarda ~10-30 min. Te aviso al terminar.")
+            f"{', '.join(steps)}" + (f" (reanudando: faltan {', '.join(pending)})" if len(pending) < len(steps) else "")
+            + f"\nDatos: {source.upper()}"
+            + ("" if source == "binance" else
+               "\n⚠ Binance bloquea esta región (EE. UU.): datos de BingX y SIN flujo agresor."
+               + ("\n⚠ BingX solo guarda ~100 días de velas de 15m o menos: el backtest cubrirá eso, no los días "
+                  "pedidos. Para un año entero: región Europa (Binance) o RESEARCH_TF=1h." if low_tf else ""))
+            + "\nTe mando cada paso al terminarlo.")
+
+    for st in pending:
+        if st == "meta" and os.path.exists(C.META_MODEL):
+            os.remove(C.META_MODEL)  # solo se envía un modelo si ESTA ejecución lo ha aprobado
+        B.SOURCE = source
+        title, fn, argv = plan[st]
+        out = run_step(title, fn, argv)
+        with open(done_path(st), "w") as f:
+            f.write(out)
+        tg_text(f"✅ {title} · memoria máx. {rss_mb():.0f} MB\n\n" + summarize(out))
 
     report = []
-    if "backtest" in steps:
-        report.append(run_step("BACKTEST (configuración actual)", B.main,
-                               ["backtest", "--symbols", sym_arg, "--tf", tf, "--days", days, "--strict", strict,
-                                "--source", source]))
-    if "entradas" in steps:
-        B.SOURCE = source
-        report.append(run_step("SWEEP ENTRADAS", sweep.main,
-                               ["sweep", "--modo", "entradas", "--symbols", sym_arg, "--tf", tf, "--days", days]))
-    if "salidas" in steps:
-        B.SOURCE = source
-        report.append(run_step("SWEEP SALIDAS", sweep.main,
-                               ["sweep", "--modo", "salidas", "--symbols", sym_arg, "--tf", tf, "--days", days]))
-    if "meta" in steps:
-        B.SOURCE = source
-        if os.path.exists(C.META_MODEL):
-            os.remove(C.META_MODEL)  # solo se envía un modelo si ESTA ejecución lo ha aprobado
-        report.append(run_step("META-ETIQUETADO", meta.main,
-                               ["meta", "--symbols", sym_arg, "--tf", tf, "--days", days, "--incluir-trampas",
-                                "--guardar-si-pasa"]))
-
-    full = "\n".join(report)
+    for st in steps:
+        if os.path.exists(done_path(st)):
+            report.append(open(done_path(st)).read())
     stamp = time.strftime("%Y%m%d_%H%M", time.gmtime())
     path = os.path.join(C.DATA_DIR, f"investigacion_{stamp}.txt")
     with open(path, "w") as f:
-        f.write(full)
-    summary = []
-    for block in report:
-        head = block.strip().splitlines()[0] if block.strip() else ""
-        summary.append(head)
-        summary += [ln.strip() for ln in block.splitlines() if KEY_LINES.search(ln.strip())][:14]
-        summary.append("")
-    tg_text("📋 RESUMEN (lo que manda: columna de PRUEBA y prueba de azar)\n\n" + "\n".join(summary)
-            + f"\nTotal {(time.time() - t0) / 60:.0f} min · informe completo en el archivo adjunto.")
+        f.write("\n".join(report))
+    tg_text(f"📋 Investigación terminada en {(time.time() - t0) / 60:.0f} min. Lo que manda: columna de PRUEBA "
+            f"del sweep y prueba de azar del meta. Informe completo adjunto.")
     tg_file(path, "Informe completo de la investigación")
-    if os.path.exists(C.META_MODEL):
+    if "meta" in pending and os.path.exists(C.META_MODEL):
         tg_file(C.META_MODEL, "meta_model.json: superó la prueba de azar. Súbelo al repo del BOT y usa "
                               "META_FILTER=aviso unas semanas antes de 'bloquea'.")
     open(marker, "w").write(stamp)

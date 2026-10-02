@@ -356,9 +356,9 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
     etiquetas de filtro; el backtest aplica después filtros + "una posición a la vez" de forma exacta.
     htf_ema: [(cierre_ms, ema)]; ctx_rows / btc_rows: velas del TF de contexto del símbolo y de BTC."""
     exits = exits or [exit_variant(cfg)]
-    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=100000, range_effort=range_effort)
-    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=100000, range_effort=range_effort) if ctx_rows else None
-    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=100000) if (btc_rows and ctx_tf_s) else None
+    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=1500, range_effort=range_effort)
+    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=1500, range_effort=range_effort) if ctx_rows else None
+    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=1500) if (btc_rows and ctx_tf_s) else None
     j = k = kb = 0
     ema = float("nan")
     cands, opens = [], []

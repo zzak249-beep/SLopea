@@ -24,6 +24,8 @@ import config as C
 from strategy import FAIL_KIND, META, MetaModel, apply_breadth, scan_candidates, select_trades
 
 TIMELINES = {}
+COVERAGE = {}
+_WARNED = set()
 
 BINANCE = "https://fapi.binance.com/fapi/v1/klines"
 BINGX = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
@@ -135,6 +137,13 @@ def load_symbol(sym, tf, days, warmup, strict, cfg, exits=None):
     if len(rows) < warmup + 50:
         print(f"{sym}: pocas velas ({len(rows)})")
         return []
+    got = (rows[-1][0] - rows[0][0]) / 86400000 - warmup * tf_s / 86400
+    COVERAGE[(sym, tf)] = (rows[0][0], rows[-1][0], got)
+    if got < days * 0.8 and (sym, tf) not in _WARNED:
+        _WARNED.add((sym, tf))
+        print(f"⚠ {sym}: solo hay {got:.0f} días útiles de {tf} (pedidos {days})"
+              + (" — BingX guarda poco histórico en TF bajos; con Binance (región Europa) o 1h hay más"
+                 if use_bingx(sym) else ""))
     ema = None
     if cfg.TREND_FILTER != "off":
         ms = C.tf_seconds(cfg.TREND_TF) * 1000
